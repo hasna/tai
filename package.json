@@ -1,0 +1,56 @@
+{
+  "name": "@hasna/tai",
+  "version": "0.1.0",
+  "description": "Terminal AI that keeps the terminal normal while turning natural-language requests into safe shell actions.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Hasna",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hasna/tai.git"
+  },
+  "homepage": "https://github.com/hasna/tai#readme",
+  "bugs": {
+    "url": "https://github.com/hasna/tai/issues"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "tai": "./dist/cli/index.js",
+    "tai-mcp": "./dist/mcp/index.js"
+  },
+  "scripts": {
+    "build": "rm -rf dist && bun build src/index.ts src/cli/index.ts src/mcp/index.ts --outdir dist --target node && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "dev:cli": "bun run src/cli/index.ts",
+    "dev:mcp": "bun run src/mcp/index.ts",
+    "postinstall": "bun run scripts/postinstall.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.18",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "bun": ">=1.2.0",
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@ai-sdk/cerebras": "^2.0.57",
+    "@ai-sdk/groq": "^3.0.42",
+    "@ai-sdk/openai-compatible": "^2.0.51",
+    "ai": "^6.0.208",
+    "zod": "^4.4.3"
+  }
+}
