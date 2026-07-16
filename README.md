@@ -102,4 +102,4 @@ bun test
 
 ## GitHub Status
 
-The intended remote is `https://github.com/hasna/tai.git`. As of 2026-06-26, private repo creation/view is blocked on this machine because `gh repo create hasna/tai --private` failed with `GraphQL: Resource not accessible by integration (createRepository)`, and `gh repo view hasna/tai` cannot resolve the repository. Do not publish this as a public repo before release approval.
+Canonical repository: https://github.com/hasna/tai
