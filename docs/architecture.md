@@ -43,9 +43,17 @@ Model IDs are intentionally configuration-driven because availability is time-se
 
 ## Agent Visibility Facade
 
-The `tai agents` surface is separate from model routing. It is a stateless, read-only facade over the installed Codewith background-agent list, Claude agent list, and Todos active-task command surfaces. A request makes one bounded, non-shell provider call per source and projects the returned batch locally; it never performs a provider read for each result.
+The `tai agents` surface is separate from model routing. It is a stateless, read-only facade over provider-owned structured APIs that are demonstrably side-effect free. It does not invoke installed Codewith, Claude, or Todos list commands because those routes can initialize state, change permissions, create databases, or mutate expired task locks.
 
-The normalized schema records only bounded status/context fields exposed by those list surfaces. Missing worktree, branch, tool, goal, task, profile, timestamp, or freshness data stays `null` and is named in `gaps`. Source failures are isolated and diagnosed with stable codes. TAI owns no database, daemon, cache, task assignment, authorization, or agent lifecycle state, and this surface contains no stop, retry, resume, profile-switch, notification, fleet, web, or TUI behavior.
+Codewith and Claude remain explicit unavailable sources until they expose a safe structured read surface. Todos list is also unavailable: its task-list implementation performs expired-lock cleanup, and its agent-list API has no authoritative source-level limit. A configured Todos API may perform one exact task `GET`, with a one-MiB response cap and a five-second wall-clock bound. Exact show calls only its selected provider. Absence is reported only after a complete targeted 404; unavailable, truncated, or unproven results remain incomplete.
+
+Normalization is omission-first. Only canonical UUIDs, narrow task short IDs, closed-set statuses, ISO timestamps within bounded clock skew, and `accountNNN` profile aliases may cross the output boundary. Provider-controlled titles, paths, branch names, tool text, goal text, raw diagnostics, URI credentials, query/fragment values, account identifiers, and nonprinting Unicode controls never do. Every null field has a stable named gap, and every source reports explicit complete/returned/dropped coverage.
+
+Todos tasks require authoritative agent, session, runner, or live-lease provenance before projection. Assignment or task status does not establish an agent. Duplicate state is selected by newest valid observation first, then explicit status precedence and a canonical tie-breaker; unknown status and invalid or future timestamps fail closed.
+
+The reusable process boundary used by provider integrations creates a process group and force-resolves on deadline or stdout/stderr byte overflow, including when descendants retain pipes. Current agent visibility uses no provider process because no installed command meets the side-effect-free contract.
+
+TAI owns no database, daemon, cache, task assignment, authorization, WorkRun, or agent lifecycle state, and this surface contains no stop, retry, resume, profile-switch, notification, fleet, web, or TUI behavior.
 
 ## Safety Policy
 

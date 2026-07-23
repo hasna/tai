@@ -1,16 +1,33 @@
 import { spawn } from "node:child_process";
-import { isAbsolute } from "node:path";
-import { redactSensitiveText } from "./redaction";
 
 export const AGENTS_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_AGENTS_LIMIT = 50;
 export const MAX_AGENTS_LIMIT = 200;
 
-const MAX_STDOUT_BYTES = 4 * 1024 * 1024;
-const MAX_STDERR_BYTES = 16 * 1024;
-const PROVIDER_TIMEOUT_MS = 15_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 5_000;
+const DEFAULT_HTTP_BYTES = 1024 * 1024;
+const DEFAULT_PROCESS_TIMEOUT_MS = 15_000;
+const DEFAULT_PROCESS_STDOUT_BYTES = 4 * 1024 * 1024;
+const DEFAULT_PROCESS_STDERR_BYTES = 16 * 1024;
+const EARLIEST_VALID_TIME_MS = Date.parse("2000-01-01T00:00:00.000Z");
 
-export type AgentProvider = "codewith" | "claude" | "todos";
+const PROVIDERS = ["codewith", "claude", "todos"] as const;
+const ACTIVE_STATUSES = new Set(["idle", "in_progress", "running"]);
+const STATUS_PRECEDENCE: Readonly<Record<string, number>> = {
+  running: 80,
+  in_progress: 70,
+  idle: 60,
+  blocked: 50,
+  pending: 40,
+  succeeded: 30,
+  completed: 30,
+  failed: 20,
+  stopped: 10,
+  cancelled: 10,
+  unknown: 0
+};
+
+export type AgentProvider = (typeof PROVIDERS)[number];
 export type AgentSourceStatus = "ok" | "partial" | "unavailable" | "error";
 
 export interface AgentSourceError {
@@ -18,10 +35,18 @@ export interface AgentSourceError {
   message: string;
 }
 
+export interface AgentSourceCoverage {
+  complete: boolean;
+  provider_records: number | null;
+  projected_records: number;
+  dropped_records: number | null;
+}
+
 export interface AgentSource {
   provider: AgentProvider;
   status: AgentSourceStatus;
   freshness_at: string | null;
+  coverage: AgentSourceCoverage;
   error?: AgentSourceError;
 }
 
@@ -67,23 +92,44 @@ export interface AgentsEnvelope {
   error?: AgentSourceError;
 }
 
-export interface ProviderCommand {
+export interface ProviderHttpRequest {
   provider: AgentProvider;
-  command: string;
-  args: string[];
+  method: "GET";
+  url: string;
+  headers: Readonly<Record<string, string>>;
+  timeoutMs: number;
+  maxBytes: number;
 }
 
-export interface ProviderCommandResult {
+export interface ProviderHttpResult {
+  status: number | null;
+  body: string;
+  failure?: "network-error" | "output-limit" | "timeout";
+}
+
+export type ProviderHttpRunner = (request: ProviderHttpRequest) => Promise<ProviderHttpResult>;
+
+export interface ProviderProcessRequest {
+  command: string;
+  args: string[];
+  timeoutMs?: number;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ProviderProcessResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
-  failure?: "not-found" | "timeout" | "output-limit" | "spawn-error";
+  failure?: "not-found" | "output-limit" | "spawn-error" | "timeout";
 }
 
-export type ProviderCommandRunner = (command: ProviderCommand) => Promise<ProviderCommandResult>;
-
 export interface CollectAgentsOptions {
-  runner?: ProviderCommandRunner;
+  env?: Readonly<Record<string, string | undefined>>;
+  httpRunner?: ProviderHttpRunner;
+  limit?: number;
   now?: () => Date;
 }
 
@@ -93,56 +139,50 @@ export interface AgentsCliResult {
   stderr: string;
 }
 
+interface ParsedAgentsArguments {
+  json: boolean;
+  limit: number;
+  limitSpecified: boolean;
+  mode: "list" | "show";
+  id: string | null;
+}
+
 interface ProviderCollection {
   source: AgentSource;
   agents: AgentRecord[];
 }
 
-interface NormalizeResult {
-  agents: AgentRecord[];
-  skipped: number;
+interface TodosConfig {
+  baseUrl: URL;
+  apiKey: string | null;
 }
 
-interface ParsedAgentsArguments {
-  json: boolean;
-  limit: number;
-  mode: "list" | "show";
-  id: string | null;
+interface NormalizedStatus {
+  value: string;
+  active: boolean;
+  complete: boolean;
 }
 
-const PROVIDER_COMMANDS: ProviderCommand[] = [
-  {
-    provider: "codewith",
-    command: "codewith",
-    args: ["agent", "list", "--json", "--limit", String(MAX_AGENTS_LIMIT)]
-  },
-  {
-    provider: "claude",
-    command: "claude",
-    args: ["agents", "--json"]
-  },
-  {
-    provider: "todos",
-    command: "todos",
-    args: ["active", "--json"]
-  }
-];
-
-export async function collectAgentVisibility(options: CollectAgentsOptions = {}): Promise<AgentsEnvelope> {
-  const runner = options.runner ?? runProviderCommand;
-  const generatedAt = (options.now ?? (() => new Date()))().toISOString();
+export async function collectAgentVisibility(
+  options: CollectAgentsOptions = {}
+): Promise<AgentsEnvelope> {
+  const now = options.now ?? (() => new Date());
+  const generatedAt = safeNow(now);
+  const limit = validateLimit(options.limit ?? DEFAULT_AGENTS_LIMIT);
   const collections = await Promise.all(
-    PROVIDER_COMMANDS.map((command) => collectProvider(command, runner, generatedAt))
+    PROVIDERS.map((provider) => collectProvider(provider, null, options, now))
   );
   const sources = collections.map(({ source }) => source);
-  const agents = sortAgents(dedupeAgents(collections.flatMap((collection) => collection.agents)));
+  const allAgents = sortAgents(dedupeAgents(collections.flatMap(({ agents }) => agents)));
+  const visibleAgents = allAgents.slice(0, limit);
+  applyResultLimitCoverage(sources, allAgents, visibleAgents);
 
   return {
     schema_version: AGENTS_SCHEMA_VERSION,
     generated_at: generatedAt,
-    partial: sources.some(({ status }) => status !== "ok"),
+    partial: sources.some(({ status, coverage }) => status !== "ok" || !coverage.complete),
     sources,
-    agents
+    agents: visibleAgents
   };
 }
 
@@ -150,112 +190,159 @@ export async function runAgentsCli(
   args: string[],
   options: CollectAgentsOptions = {}
 ): Promise<AgentsCliResult> {
-  const generatedAt = (options.now ?? (() => new Date()))().toISOString();
+  const now = options.now ?? (() => new Date());
+  const generatedAt = safeNow(now);
   let parsed: ParsedAgentsArguments;
 
   try {
     parsed = parseAgentsArguments(args);
-  } catch (error) {
-    const diagnostic = makeDiagnostic("invalid-arguments", error);
-    const json = args.includes("--json");
-    return {
-      exitCode: 2,
-      stdout: json ? JSON.stringify(errorEnvelope(generatedAt, diagnostic), null, 2) : "",
-      stderr: json ? "" : `error: ${diagnostic.message}`
-    };
+  } catch {
+    return cliError(
+      2,
+      args.includes("--json"),
+      errorEnvelope(generatedAt, {
+        code: "invalid-arguments",
+        message:
+          "Usage: tai agents [--json] [--limit <1-200>] | tai agents show <provider>:<run-id> [--json]."
+      })
+    );
   }
 
-  if (parsed.mode === "show" && !isValidAgentId(parsed.id)) {
-    const diagnostic: AgentSourceError = {
-      code: "invalid-agent-id",
-      message: "Agent ID must use <codewith|claude|todos>:<run-id>."
-    };
-    return {
-      exitCode: 2,
-      stdout: parsed.json ? JSON.stringify(errorEnvelope(generatedAt, diagnostic), null, 2) : "",
-      stderr: parsed.json ? "" : `error: ${diagnostic.message}`
-    };
+  const parsedId = parsed.mode === "show" ? parseAgentId(parsed.id) : null;
+  if (parsed.mode === "show" && !parsedId) {
+    return cliError(
+      2,
+      parsed.json,
+      errorEnvelope(generatedAt, {
+        code: "invalid-agent-id",
+        message: "Agent ID must use <codewith|claude|todos>:<safe-run-id>."
+      })
+    );
   }
 
-  const envelope = await collectAgentVisibility(options);
-  const availableSources = envelope.sources.filter(
-    ({ status }) => status === "ok" || status === "partial"
-  );
-
-  if (availableSources.length === 0) {
-    const diagnostic: AgentSourceError = {
-      code: "all-sources-failed",
-      message: "No authoritative agent source is currently available."
-    };
-    const failedEnvelope = { ...envelope, error: diagnostic };
-    return {
-      exitCode: 3,
-      stdout: parsed.json ? JSON.stringify(failedEnvelope, null, 2) : "",
-      stderr: parsed.json ? "" : `error: ${diagnostic.message}`
-    };
+  if (parsed.mode === "show" && parsed.limitSpecified) {
+    return cliError(
+      2,
+      parsed.json,
+      errorEnvelope(generatedAt, {
+        code: "invalid-arguments",
+        message: "--limit is not valid for an exact agent lookup."
+      })
+    );
   }
 
-  if (parsed.mode === "show") {
+  if (parsed.mode === "show" && parsedId) {
+    const collection = await collectProvider(parsedId.provider, parsedId.runId, options, now);
+    const envelope: AgentsEnvelope = {
+      schema_version: AGENTS_SCHEMA_VERSION,
+      generated_at: generatedAt,
+      partial:
+        collection.source.status !== "ok" || !collection.source.coverage.complete,
+      sources: [collection.source],
+      agents: sortAgents(dedupeAgents(collection.agents))
+    };
     const agent = envelope.agents.find(({ id }) => id === parsed.id);
-    if (!agent) {
-      const diagnostic: AgentSourceError = {
-        code: "agent-not-found",
-        message: "No normalized agent record matched the requested ID."
-      };
-      const unknownEnvelope: AgentsEnvelope = { ...envelope, agents: [], error: diagnostic };
+
+    if (agent) {
+      envelope.agents = [agent];
       return {
-        exitCode: 4,
-        stdout: parsed.json ? JSON.stringify(unknownEnvelope, null, 2) : "",
-        stderr: parsed.json ? "" : `error: ${diagnostic.message}`
+        exitCode: 0,
+        stdout: parsed.json
+          ? JSON.stringify(envelope, null, 2)
+          : formatAgentDetails(agent, envelope.sources),
+        stderr: ""
       };
     }
 
-    const showEnvelope: AgentsEnvelope = { ...envelope, agents: [agent] };
-    return {
-      exitCode: 0,
-      stdout: parsed.json ? JSON.stringify(showEnvelope, null, 2) : formatAgentDetails(agent, envelope.sources),
-      stderr: ""
+    if (
+      collection.source.status === "ok" &&
+      collection.source.coverage.complete &&
+      collection.source.coverage.dropped_records === 0
+    ) {
+      envelope.error = {
+        code: "agent-not-found",
+        message: "The selected provider proved that no exact agent record exists."
+      };
+      return cliError(4, parsed.json, envelope);
+    }
+
+    envelope.error = {
+      code: "agent-lookup-incomplete",
+      message: "The selected provider could not prove an exact lookup result."
     };
+    return cliError(5, parsed.json, envelope);
   }
 
-  const limitedEnvelope: AgentsEnvelope = {
-    ...envelope,
-    agents: envelope.agents.slice(0, parsed.limit)
-  };
+  const envelope = await collectAgentVisibility({ ...options, limit: parsed.limit, now });
+  if (!envelope.sources.some(({ status }) => status === "ok" || status === "partial")) {
+    envelope.error = {
+      code: "all-sources-unavailable",
+      message: "No side-effect-free authoritative agent source is configured."
+    };
+    return parsed.json
+      ? cliError(3, true, envelope)
+      : {
+          exitCode: 3,
+          stdout: formatAgentsTable(envelope),
+          stderr: `error: ${envelope.error.message}`
+        };
+  }
+
   return {
     exitCode: 0,
-    stdout: parsed.json ? JSON.stringify(limitedEnvelope, null, 2) : formatAgentsTable(limitedEnvelope),
+    stdout: parsed.json ? JSON.stringify(envelope, null, 2) : formatAgentsTable(envelope),
     stderr: ""
   };
 }
 
 export function formatAgentsTable(envelope: AgentsEnvelope): string {
-  const rows = envelope.agents.map((agent) => [
-    `${agent.active ? "active" : "inactive"}:${agent.status}`,
-    agent.id,
-    agent.worktree ?? "—",
-    formatTaskGoal(agent),
-    agent.last_tool_call.name ?? "—",
-    agent.freshness_at ?? "—"
-  ]);
-  const widths = [24, 36, 36, 30, 22, 24];
-  const headers = ["STATUS", "PROVIDER/RUN", "WORKTREE", "TASK/GOAL", "LAST TOOL", "FRESHNESS"];
+  const widths = [23, 46, 12, 28, 20, 24];
+  const headers = [
+    "STATUS",
+    "PROVIDER/RUN",
+    "WORKTREE",
+    "TASK/GOAL",
+    "LAST TOOL",
+    "FRESHNESS"
+  ];
+  const rows = envelope.agents.map((agent) => {
+    const status = safeOutputStatus(agent.status);
+    const active = agent.active && ACTIVE_STATUSES.has(status);
+    return [
+      `${active ? "active" : "inactive"}:${status}`,
+      safeOutputAgentId(agent.id),
+      "—",
+      formatTaskGoal(agent),
+      "—",
+      safeOutputTimestamp(agent.freshness_at)
+    ];
+  });
   const lines = [
-    headers.map((value, index) => padCell(value, widths[index] ?? value.length)).join("  "),
-    rows
-      .map((row) => row.map((value, index) => padCell(value, widths[index] ?? value.length)).join("  "))
-      .join("\n")
-  ].filter(Boolean);
+    headers.map((value, index) => fitCell(value, widths[index] ?? 20)).join("  "),
+    ...rows.map((row) =>
+      row.map((value, index) => fitCell(value, widths[index] ?? 20)).join("  ")
+    )
+  ];
 
   if (envelope.agents.length === 0) {
-    lines.push("No agents found.");
+    lines.push("No safely projectable agents found.");
   }
 
-  const warnings = envelope.sources
-    .filter(({ status }) => status !== "ok")
-    .map((source) => `${source.provider}=${source.status}${source.error ? `:${source.error.code}` : ""}`);
+  const warnings = envelope.sources.flatMap((source) => {
+    if (
+      !PROVIDERS.includes(source.provider) ||
+      (source.status === "ok" && source.coverage.complete)
+    ) {
+      return [];
+    }
+    return [
+      `${source.provider}=${safeSourceStatus(source.status)}${
+        source.error ? `:${safeDiagnosticCode(source.error.code)}` : ""
+      }`
+    ];
+  });
   if (warnings.length > 0) {
-    lines.push(`WARNING partial sources: ${warnings.join(", ")}`);
+    lines.push(`WARNING incomplete sources: ${warnings.join(", ")}`);
   }
 
   return lines.join("\n");
@@ -263,346 +350,753 @@ export function formatAgentsTable(envelope: AgentsEnvelope): string {
 
 export function dedupeAgents(agents: AgentRecord[]): AgentRecord[] {
   const deduped = new Map<string, AgentRecord>();
-  for (const agent of agents) {
-    const current = deduped.get(agent.id);
-    if (!current || compareFreshness(agent, current) < 0) {
-      deduped.set(agent.id, agent);
+  for (const candidate of agents) {
+    const current = deduped.get(candidate.id);
+    if (!current || compareObservations(candidate, current) < 0) {
+      deduped.set(candidate.id, candidate);
     }
   }
   return [...deduped.values()];
 }
 
 export function sortAgents(agents: AgentRecord[]): AgentRecord[] {
-  return [...agents].sort(compareFreshness);
+  return [...agents].sort((left, right) => {
+    if (left.active !== right.active) {
+      return left.active ? -1 : 1;
+    }
+    const observationOrder = compareObservationTime(left, right);
+    if (observationOrder !== 0) {
+      return observationOrder;
+    }
+    return left.id.localeCompare(right.id);
+  });
 }
 
-function compareFreshness(left: AgentRecord, right: AgentRecord): number {
-  if (left.active !== right.active) {
-    return left.active ? -1 : 1;
-  }
-  const leftTime = Date.parse(left.updated_at ?? "");
-  const rightTime = Date.parse(right.updated_at ?? "");
-  const normalizedLeft = Number.isFinite(leftTime) ? leftTime : Number.NEGATIVE_INFINITY;
-  const normalizedRight = Number.isFinite(rightTime) ? rightTime : Number.NEGATIVE_INFINITY;
-  if (normalizedLeft !== normalizedRight) {
-    return normalizedRight - normalizedLeft;
-  }
-  return left.id.localeCompare(right.id);
+export async function runBoundedProviderProcess(
+  request: ProviderProcessRequest
+): Promise<ProviderProcessResult> {
+  const timeoutMs = positiveBound(request.timeoutMs, DEFAULT_PROCESS_TIMEOUT_MS);
+  const maxStdoutBytes = positiveBound(
+    request.maxStdoutBytes,
+    DEFAULT_PROCESS_STDOUT_BYTES
+  );
+  const maxStderrBytes = positiveBound(
+    request.maxStderrBytes,
+    DEFAULT_PROCESS_STDERR_BYTES
+  );
+
+  return await new Promise((resolve) => {
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    const child = spawn(request.command, request.args, {
+      cwd: request.cwd,
+      detached: process.platform !== "win32",
+      env: request.env ?? process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    const finish = (
+      exitCode: number | null,
+      failure?: ProviderProcessResult["failure"]
+    ): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout: stdout.toString("utf8"),
+        stderr: stderr.toString("utf8"),
+        exitCode,
+        ...(failure ? { failure } : {})
+      });
+    };
+
+    const terminateGroup = (failure: "output-limit" | "timeout"): void => {
+      if (settled) {
+        return;
+      }
+      if (child.pid && process.platform !== "win32") {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // The process group may already be gone.
+        }
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The direct child may already be gone.
+      }
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.unref();
+      finish(null, failure);
+    };
+
+    const timer = setTimeout(() => terminateGroup("timeout"), timeoutMs);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdout.length + chunk.length > maxStdoutBytes) {
+        terminateGroup("output-limit");
+        return;
+      }
+      stdout = Buffer.concat([stdout, chunk]);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length + chunk.length > maxStderrBytes) {
+        terminateGroup("output-limit");
+        return;
+      }
+      stderr = Buffer.concat([stderr, chunk]);
+    });
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      finish(null, error.code === "ENOENT" ? "not-found" : "spawn-error");
+    });
+    child.on("close", (exitCode) => finish(exitCode));
+  });
 }
 
 async function collectProvider(
-  command: ProviderCommand,
-  runner: ProviderCommandRunner,
-  generatedAt: string
+  provider: AgentProvider,
+  exactRunId: string | null,
+  options: CollectAgentsOptions,
+  now: () => Date
 ): Promise<ProviderCollection> {
-  let result: ProviderCommandResult;
-  try {
-    result = await runner(command);
-  } catch (error) {
-    return failedCollection(command.provider, "provider-execution-error", error, "error");
+  if (provider === "codewith" || provider === "claude") {
+    return unsupportedCollection(
+      provider,
+      "side-effect-free-surface-unavailable",
+      `No side-effect-free structured ${provider} agent read surface is configured.`
+    );
+  }
+  return await collectTodos(exactRunId, options, now);
+}
+
+async function collectTodos(
+  exactRunId: string | null,
+  options: CollectAgentsOptions,
+  now: () => Date
+): Promise<ProviderCollection> {
+  if (!exactRunId) {
+    return unsupportedCollection(
+      "todos",
+      "side-effect-free-source-limit-unavailable",
+      "Todos has no side-effect-free source-level bounded list surface."
+    );
+  }
+  const env = options.env ?? process.env;
+  const config = resolveTodosConfig(env);
+  if (!config) {
+    return unsupportedCollection(
+      "todos",
+      "side-effect-free-surface-unavailable",
+      "No side-effect-free Todos API is configured."
+    );
   }
 
+  const url = buildTodosUrl(config.baseUrl, exactRunId);
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (config.apiKey) {
+    headers["x-api-key"] = config.apiKey;
+  }
+  const result = await (options.httpRunner ?? runBoundedHttpRequest)({
+    provider: "todos",
+    method: "GET",
+    url,
+    headers,
+    timeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
+    maxBytes: DEFAULT_HTTP_BYTES
+  });
+  const observedAt = safeNow(now);
+
   if (result.failure) {
-    const errorByFailure: Record<
-      NonNullable<ProviderCommandResult["failure"]>,
-      { code: string; message: string; status: AgentSourceStatus }
+    const failureMessages: Record<
+      NonNullable<ProviderHttpResult["failure"]>,
+      AgentSourceError
     > = {
-      "not-found": {
-        code: "provider-command-unavailable",
-        message: `${command.provider} command is not installed or discoverable.`,
-        status: "unavailable"
-      },
-      timeout: {
-        code: "provider-timeout",
-        message: `${command.provider} did not respond within the bounded timeout.`,
-        status: "error"
+      "network-error": {
+        code: "provider-network-error",
+        message: "The side-effect-free Todos API request failed."
       },
       "output-limit": {
         code: "provider-output-limit",
-        message: `${command.provider} exceeded the bounded output limit.`,
-        status: "error"
+        message: "The side-effect-free Todos API exceeded the response byte limit."
       },
-      "spawn-error": {
-        code: "provider-spawn-error",
-        message: `Unable to execute the ${command.provider} read-only surface.`,
-        status: "error"
+      timeout: {
+        code: "provider-timeout",
+        message: "The side-effect-free Todos API exceeded the wall-clock limit."
       }
     };
-    const failure = errorByFailure[result.failure];
-    return failedCollection(command.provider, failure.code, failure.message, failure.status);
+    return failedCollection("todos", observedAt, failureMessages[result.failure]);
   }
 
-  if (result.exitCode !== 0) {
-    const message = sanitizeDiagnostic(result.stderr) || `${command.provider} returned a nonzero exit.`;
-    return failedCollection(command.provider, "provider-nonzero-exit", message, "error");
+  if (exactRunId && result.status === 404) {
+    return {
+      source: {
+        provider: "todos",
+        status: "ok",
+        freshness_at: observedAt,
+        coverage: {
+          complete: true,
+          provider_records: 0,
+          projected_records: 0,
+          dropped_records: 0
+        }
+      },
+      agents: []
+    };
+  }
+
+  if (result.status === null || result.status < 200 || result.status >= 300) {
+    return failedCollection("todos", observedAt, {
+      code: "provider-http-error",
+      message: "The side-effect-free Todos API returned a non-success status."
+    });
   }
 
   let payload: unknown;
   try {
-    payload = JSON.parse(result.stdout) as unknown;
+    payload = JSON.parse(result.body) as unknown;
   } catch {
-    return failedCollection(
-      command.provider,
-      "provider-invalid-json",
-      `${command.provider} returned invalid JSON.`,
-      "error"
-    );
+    return failedCollection("todos", observedAt, {
+      code: "provider-invalid-json",
+      message: "The side-effect-free Todos API returned invalid JSON."
+    });
   }
 
-  let normalized: NormalizeResult;
-  try {
-    normalized = normalizeProvider(command.provider, payload, generatedAt);
-  } catch {
-    return failedCollection(
-      command.provider,
-      "provider-invalid-payload",
-      `${command.provider} returned an unsupported JSON shape.`,
-      "error"
-    );
-  }
+  return normalizeTodosExact(payload, exactRunId, observedAt);
+}
 
-  if (normalized.skipped > 0) {
+function normalizeTodosExact(
+  payload: unknown,
+  exactRunId: string,
+  observedAt: string
+): ProviderCollection {
+  if (!isRecord(payload) || !isRecord(payload.task)) {
+    return failedCollection("todos", observedAt, {
+      code: "provider-invalid-payload",
+      message: "The side-effect-free Todos API returned an unsupported exact record."
+    });
+  }
+  const raw = payload.task;
+  if (safeUuid(raw.id) !== exactRunId) {
+    return failedCollection("todos", observedAt, {
+      code: "provider-identity-mismatch",
+      message: "The side-effect-free Todos API returned a different exact record."
+    });
+  }
+  if (!hasTodosAgentProvenance(raw, observedAt)) {
     return {
       source: {
-        provider: command.provider,
+        provider: "todos",
         status: "partial",
-        freshness_at: generatedAt,
+        freshness_at: observedAt,
+        coverage: {
+          complete: true,
+          provider_records: 1,
+          projected_records: 0,
+          dropped_records: 1
+        },
         error: {
-          code: "provider-records-skipped",
-          message: `${normalized.skipped} malformed provider record(s) were skipped.`
+          code: "agent-provenance-missing",
+          message: "The exact Todos task has no authoritative agent, session, or live lease provenance."
         }
       },
-      agents: normalized.agents
+      agents: []
     };
   }
-
+  const record = normalizeTodosTask(raw, observedAt);
+  if (!record) {
+    return {
+      source: {
+        provider: "todos",
+        status: "partial",
+        freshness_at: observedAt,
+        coverage: {
+          complete: false,
+          provider_records: 1,
+          projected_records: 0,
+          dropped_records: 1
+        },
+        error: {
+          code: "record-withheld",
+          message: "The exact Todos record did not satisfy the safe-output contract."
+        }
+      },
+      agents: []
+    };
+  }
+  const incomplete = record.gaps.length > 0;
   return {
     source: {
-      provider: command.provider,
-      status: "ok",
-      freshness_at: generatedAt
+      provider: "todos",
+      status: incomplete ? "partial" : "ok",
+      freshness_at: observedAt,
+      coverage: {
+        complete: true,
+        provider_records: 1,
+        projected_records: 1,
+        dropped_records: 0
+      },
+      ...(incomplete
+        ? {
+            error: {
+              code: "normalized-fields-unavailable",
+              message: "The exact Todos record has explicit unavailable normalized fields."
+            }
+          }
+        : {})
     },
-    agents: normalized.agents
+    agents: [record]
   };
 }
 
-function normalizeProvider(
-  provider: AgentProvider,
-  payload: unknown,
-  sourceFreshness: string
-): NormalizeResult {
-  switch (provider) {
-    case "codewith":
-      return normalizeCodewith(payload, sourceFreshness);
-    case "claude":
-      return normalizeClaude(payload, sourceFreshness);
-    case "todos":
-      return normalizeTodos(payload, sourceFreshness);
+function normalizeTodosTask(
+  raw: Record<string, unknown>,
+  observedAt: string
+): AgentRecord | null {
+  const runId = safeUuid(raw.id);
+  if (!runId) {
+    return null;
   }
+  const observedAtMs = Date.parse(observedAt);
+  const status = normalizeStatus(raw.status);
+  let startedAt = normalizeTimestamp(raw.started_at ?? raw.created_at, observedAtMs);
+  const updatedAt = normalizeTimestamp(raw.updated_at ?? raw.synced_at, observedAtMs);
+  if (startedAt && updatedAt && Date.parse(startedAt) > Date.parse(updatedAt)) {
+    startedAt = null;
+  }
+  const metadata = isRecord(raw.metadata) ? raw.metadata : {};
+  const shortId = safeShortId(raw.short_id);
+  const profileAlias = safeProfileAlias(raw.profile_alias ?? metadata.profile_alias);
+  const gaps: string[] = [];
+
+  if (!status.complete) gaps.push("status");
+  if (!startedAt) gaps.push("started_at");
+  if (!updatedAt) gaps.push("updated_at");
+  gaps.push(
+    "worktree",
+    "branch",
+    "last_tool_call.name",
+    "last_tool_call.at",
+    "last_tool_call.summary",
+    "goal.id",
+    "goal.title",
+    "goal.status"
+  );
+  if (!shortId) gaps.push("task.short_id");
+  gaps.push("task.title");
+  if (!status.complete) gaps.push("task.status");
+  if (!profileAlias) gaps.push("profile.alias");
+  if (!updatedAt) gaps.push("freshness_at");
+
+  return {
+    id: `todos:${runId}`,
+    provider: "todos",
+    run_id: runId,
+    status: status.value,
+    active: status.active,
+    started_at: startedAt,
+    updated_at: updatedAt,
+    worktree: null,
+    branch: null,
+    last_tool_call: { name: null, at: null, summary: null },
+    goal: { id: null, title: null, status: null },
+    task: {
+      id: runId,
+      short_id: shortId,
+      title: null,
+      status: status.complete ? status.value : null
+    },
+    profile: { alias: profileAlias },
+    freshness_at: updatedAt,
+    gaps: [...new Set(gaps)].sort()
+  };
 }
 
-function normalizeCodewith(payload: unknown, sourceFreshness: string): NormalizeResult {
-  if (!isRecord(payload) || !Array.isArray(payload.data)) {
-    throw new Error("unsupported Codewith payload");
+function hasTodosAgentProvenance(
+  raw: Record<string, unknown>,
+  observedAt: string
+): boolean {
+  const metadata = isRecord(raw.metadata) ? raw.metadata : {};
+  const directValues = [
+    raw.agent_id,
+    raw.session_id,
+    raw.runner_id,
+    metadata.agent_id,
+    metadata.session_id,
+    metadata.run_id
+  ];
+  if (directValues.some(hasOpaqueProvenanceValue)) {
+    return true;
   }
-  const agents: AgentRecord[] = [];
-  let skipped = 0;
 
-  for (const raw of payload.data.slice(0, MAX_AGENTS_LIMIT)) {
-    if (!isRecord(raw)) {
-      skipped += 1;
-      continue;
-    }
-    const runId = safeOpaqueId(raw.agentId);
-    if (!runId) {
-      skipped += 1;
-      continue;
-    }
-    const status = boundedText(raw.status, 64) ?? "unknown";
-    const updatedAt = latestTimestamp(raw.updatedAt, raw.heartbeatAt);
-    const profileAlias = safeProfileAlias(raw.authProfileRef);
-    const gaps = [
-      "worktree unavailable from Codewith list surface",
-      "branch unavailable from Codewith list surface",
-      "last_tool_call unavailable from Codewith list surface",
-      "goal unavailable from Codewith list surface",
-      "task unavailable from Codewith list surface"
-    ];
-    if (status === "unknown") {
-      gaps.push("status unavailable from Codewith list surface");
-    }
-    if (!updatedAt) {
-      gaps.push("updated_at unavailable from Codewith list surface");
-    }
-    if (!profileAlias) {
-      gaps.push(
-        raw.authProfileRef == null
-          ? "profile unavailable from Codewith list surface"
-          : "profile reference withheld because it is not a safe alias"
-      );
-    }
+  const leaseOwner = raw.locked_by ?? metadata.locked_by;
+  const leaseExpiry = raw.lock_expires_at ?? metadata.lock_expires_at;
+  if (!hasOpaqueProvenanceValue(leaseOwner)) {
+    return false;
+  }
+  const expiryMs = parseTimestampMs(leaseExpiry);
+  const observedMs = Date.parse(observedAt);
+  return (
+    expiryMs !== null &&
+    expiryMs >= observedMs &&
+    expiryMs <= observedMs + 24 * 60 * 60 * 1000
+  );
+}
 
-    agents.push({
-      id: `codewith:${runId}`,
-      provider: "codewith",
-      run_id: runId,
-      status,
-      active: isActiveStatus(status),
-      started_at: normalizeTimestamp(raw.startedAt ?? raw.createdAt),
-      updated_at: updatedAt,
-      worktree: null,
-      branch: null,
-      last_tool_call: emptyLastToolCall(),
-      goal: emptyGoal(),
-      task: emptyTask(),
-      profile: { alias: profileAlias },
-      freshness_at: updatedAt ?? sourceFreshness,
-      gaps
+function hasOpaqueProvenanceValue(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 256 &&
+    value.trim() === value &&
+    !NONPRINTING_PATTERN.test(value)
+  );
+}
+
+function normalizeStatus(value: unknown): NormalizedStatus {
+  if (typeof value !== "string") {
+    return { value: "unknown", active: false, complete: false };
+  }
+  const candidate = value.trim().toLowerCase();
+  if (candidate === "unknown" || !(candidate in STATUS_PRECEDENCE)) {
+    return { value: "unknown", active: false, complete: false };
+  }
+  return {
+    value: candidate,
+    active: ACTIVE_STATUSES.has(candidate),
+    complete: true
+  };
+}
+
+function normalizeTimestamp(value: unknown, observedAtMs: number): string | null {
+  const milliseconds = parseTimestampMs(value);
+  if (
+    milliseconds === null ||
+    milliseconds < EARLIEST_VALID_TIME_MS ||
+    milliseconds > observedAtMs
+  ) {
+    return null;
+  }
+  return new Date(milliseconds).toISOString();
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  let milliseconds: number;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    milliseconds = value > 10_000_000_000 ? value : value * 1000;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    const numeric = Number(value);
+    milliseconds = Number.isFinite(numeric)
+      ? numeric > 10_000_000_000
+        ? numeric
+        : numeric * 1000
+      : Date.parse(value);
+  } else {
+    return null;
+  }
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+
+function safeUuid(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const candidate = value.toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+    candidate
+  )
+    ? candidate
+    : null;
+}
+
+function safeShortId(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  return /^[A-Z][A-Z0-9]{0,7}-[0-9]{1,8}$/.test(value) ? value : null;
+}
+
+function safeProfileAlias(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  return /^account[0-9]{3}$/.test(value) ? value : null;
+}
+
+function resolveTodosConfig(
+  env: Readonly<Record<string, string | undefined>>
+): TodosConfig | null {
+  const rawBaseUrl = env.TODOS_URL ?? env.TODOS_API_URL;
+  if (!rawBaseUrl) {
+    return null;
+  }
+  let baseUrl: URL;
+  try {
+    baseUrl = new URL(rawBaseUrl);
+  } catch {
+    return null;
+  }
+  if (
+    (baseUrl.protocol !== "https:" &&
+      !(baseUrl.protocol === "http:" && isLoopbackHostname(baseUrl.hostname))) ||
+    baseUrl.username !== "" ||
+    baseUrl.password !== "" ||
+    baseUrl.search !== "" ||
+    baseUrl.hash !== ""
+  ) {
+    return null;
+  }
+  return {
+    baseUrl,
+    apiKey: env.TODOS_API_KEY || null
+  };
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function buildTodosUrl(baseUrl: URL, exactRunId: string): string {
+  const url = new URL(baseUrl.toString());
+  const prefix = url.pathname.replace(/\/+$/, "");
+  url.pathname = `${prefix}/v1/tasks/${encodeURIComponent(exactRunId)}`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+export async function runBoundedHttpRequest(
+  request: ProviderHttpRequest
+): Promise<ProviderHttpResult> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, request.timeoutMs);
+
+  try {
+    const response = await fetch(request.url, {
+      method: request.method,
+      headers: request.headers,
+      signal: controller.signal,
+      redirect: "error"
     });
+    if (!response.body) {
+      return { status: response.status, body: "" };
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    while (true) {
+      const item = await reader.read();
+      if (item.done) {
+        break;
+      }
+      bytes += item.value.byteLength;
+      if (bytes > request.maxBytes) {
+        controller.abort();
+        await reader.cancel().catch(() => undefined);
+        return { status: response.status, body: "", failure: "output-limit" };
+      }
+      chunks.push(item.value);
+    }
+    return {
+      status: response.status,
+      body: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")
+    };
+  } catch {
+    return {
+      status: null,
+      body: "",
+      failure: timedOut ? "timeout" : "network-error"
+    };
+  } finally {
+    clearTimeout(timer);
   }
-
-  return { agents, skipped };
 }
 
-function normalizeClaude(payload: unknown, sourceFreshness: string): NormalizeResult {
-  if (!Array.isArray(payload)) {
-    throw new Error("unsupported Claude payload");
-  }
-  const agents: AgentRecord[] = [];
-  let skipped = 0;
-
-  for (const raw of payload.slice(0, MAX_AGENTS_LIMIT)) {
-    if (!isRecord(raw)) {
-      skipped += 1;
-      continue;
-    }
-    const runId = safeOpaqueId(raw.sessionId ?? raw.id);
-    if (!runId) {
-      skipped += 1;
-      continue;
-    }
-    const status = boundedText(raw.status ?? raw.state, 64) ?? "unknown";
-    const worktree = safeAbsolutePath(raw.cwd);
-    const gaps = [
-      "updated_at unavailable from Claude agents surface",
-      "branch unavailable from Claude agents surface",
-      "last_tool_call unavailable from Claude agents surface",
-      "goal unavailable from Claude agents surface",
-      "task unavailable from Claude agents surface",
-      "profile unavailable from Claude agents surface",
-      "agent freshness unavailable; using source observation time"
-    ];
-    if (status === "unknown") {
-      gaps.push("status unavailable from Claude agents surface");
-    }
-    if (!worktree) {
-      gaps.push("worktree unavailable from Claude agents surface");
-    }
-
-    agents.push({
-      id: `claude:${runId}`,
-      provider: "claude",
-      run_id: runId,
-      status,
-      active: !isTerminalStatus(status),
-      started_at: normalizeTimestamp(raw.startedAt),
-      updated_at: null,
-      worktree,
-      branch: null,
-      last_tool_call: emptyLastToolCall(),
-      goal: emptyGoal(),
-      task: emptyTask(),
-      profile: { alias: null },
-      freshness_at: sourceFreshness,
-      gaps
-    });
-  }
-
-  return { agents, skipped };
-}
-
-function normalizeTodos(payload: unknown, sourceFreshness: string): NormalizeResult {
-  if (!Array.isArray(payload)) {
-    throw new Error("unsupported Todos payload");
-  }
-  const agents: AgentRecord[] = [];
-  let skipped = 0;
-
-  for (const raw of payload.slice(0, MAX_AGENTS_LIMIT)) {
-    if (!isRecord(raw)) {
-      skipped += 1;
-      continue;
-    }
-    const runId = safeOpaqueId(raw.id);
-    if (!runId) {
-      skipped += 1;
-      continue;
-    }
-    const status = boundedText(raw.status, 64) ?? "unknown";
-    const metadata = isRecord(raw.metadata) ? raw.metadata : {};
-    const worktree = safeAbsolutePath(raw.working_dir ?? metadata.worktree);
-    const branch = safeBranch(metadata.branch);
-    const updatedAt = normalizeTimestamp(raw.updated_at ?? raw.synced_at);
-    const gaps = [
-      "last_tool_call unavailable from Todos active surface",
-      "goal unavailable from Todos active surface",
-      "profile unavailable from Todos active surface"
-    ];
-    if (status === "unknown") {
-      gaps.push("status unavailable from Todos active surface");
-    }
-    if (!worktree) {
-      gaps.push("worktree unavailable from Todos active surface");
-    }
-    if (!branch) {
-      gaps.push("branch unavailable from Todos active surface");
-    }
-    if (!updatedAt) {
-      gaps.push("updated_at unavailable from Todos active surface");
-    }
-
-    agents.push({
-      id: `todos:${runId}`,
-      provider: "todos",
-      run_id: runId,
-      status,
-      active: !isTerminalStatus(status),
-      started_at: normalizeTimestamp(raw.started_at ?? raw.created_at),
-      updated_at: updatedAt,
-      worktree,
-      branch,
-      last_tool_call: emptyLastToolCall(),
-      goal: emptyGoal(),
-      task: {
-        id: runId,
-        short_id: boundedText(raw.short_id, 40),
-        title: boundedText(raw.title, 120),
-        status
-      },
-      profile: { alias: null },
-      freshness_at: updatedAt ?? sourceFreshness,
-      gaps
-    });
-  }
-
-  return { agents, skipped };
-}
-
-function failedCollection(
+function unsupportedCollection(
   provider: AgentProvider,
   code: string,
-  message: unknown,
-  status: AgentSourceStatus
+  message: string
 ): ProviderCollection {
   return {
     source: {
       provider,
-      status,
+      status: "unavailable",
       freshness_at: null,
-      error: makeDiagnostic(code, message)
+      coverage: {
+        complete: false,
+        provider_records: null,
+        projected_records: 0,
+        dropped_records: null
+      },
+      error: { code, message }
     },
     agents: []
   };
+}
+
+function failedCollection(
+  provider: AgentProvider,
+  observedAt: string,
+  error: AgentSourceError
+): ProviderCollection {
+  return {
+    source: {
+      provider,
+      status: "error",
+      freshness_at: observedAt,
+      coverage: {
+        complete: false,
+        provider_records: null,
+        projected_records: 0,
+        dropped_records: null
+      },
+      error
+    },
+    agents: []
+  };
+}
+
+function applyResultLimitCoverage(
+  sources: AgentSource[],
+  allAgents: AgentRecord[],
+  visibleAgents: AgentRecord[]
+): void {
+  if (visibleAgents.length === allAgents.length) {
+    return;
+  }
+  const visibleIds = new Set(visibleAgents.map(({ id }) => id));
+  for (const source of sources) {
+    const sourceAgents = allAgents.filter(({ provider }) => provider === source.provider);
+    const visibleSourceAgents = sourceAgents.filter(({ id }) => visibleIds.has(id));
+    const omitted = sourceAgents.length - visibleSourceAgents.length;
+    if (omitted <= 0) {
+      continue;
+    }
+    source.status = "partial";
+    source.coverage = {
+      ...source.coverage,
+      complete: false,
+      projected_records: visibleSourceAgents.length,
+      dropped_records:
+        source.coverage.dropped_records === null
+          ? null
+          : source.coverage.dropped_records + omitted
+    };
+    source.error ??= {
+      code: "result-limit-applied",
+      message: "The requested result limit omitted safely projectable records."
+    };
+  }
+}
+
+function compareObservations(left: AgentRecord, right: AgentRecord): number {
+  const timeOrder = compareObservationTime(left, right);
+  if (timeOrder !== 0) {
+    return timeOrder;
+  }
+  const statusOrder =
+    (STATUS_PRECEDENCE[right.status] ?? 0) - (STATUS_PRECEDENCE[left.status] ?? 0);
+  if (statusOrder !== 0) {
+    return statusOrder;
+  }
+  return canonicalRecord(left).localeCompare(canonicalRecord(right));
+}
+
+function compareObservationTime(left: AgentRecord, right: AgentRecord): number {
+  return observationTime(right) - observationTime(left);
+}
+
+function observationTime(agent: AgentRecord): number {
+  for (const value of [agent.updated_at, agent.freshness_at, agent.started_at]) {
+    const parsed = value ? Date.parse(value) : Number.NaN;
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return Number.NEGATIVE_INFINITY;
+}
+
+function canonicalRecord(agent: AgentRecord): string {
+  return JSON.stringify(agent);
+}
+
+function parseAgentsArguments(args: string[]): ParsedAgentsArguments {
+  let json = false;
+  let limit = DEFAULT_AGENTS_LIMIT;
+  let limitSpecified = false;
+  const positionals: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index] ?? "";
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (argument === "--limit") {
+      const value = args[index + 1];
+      if (!value) throw new Error("invalid limit");
+      limit = validateLimit(Number(value));
+      limitSpecified = true;
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--limit=")) {
+      limit = validateLimit(Number(argument.slice("--limit=".length)));
+      limitSpecified = true;
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      throw new Error("unknown option");
+    }
+    positionals.push(argument);
+  }
+
+  if (positionals.length === 0 || (positionals.length === 1 && positionals[0] === "list")) {
+    return { json, limit, limitSpecified, mode: "list", id: null };
+  }
+  if (positionals.length === 2 && positionals[0] === "show") {
+    return {
+      json,
+      limit,
+      limitSpecified,
+      mode: "show",
+      id: positionals[1] ?? null
+    };
+  }
+  throw new Error("invalid arguments");
+}
+
+function validateLimit(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_AGENTS_LIMIT) {
+    throw new Error("invalid limit");
+  }
+  return value;
+}
+
+function parseAgentId(
+  value: string | null
+): { provider: AgentProvider; runId: string } | null {
+  if (!value) {
+    return null;
+  }
+  const separator = value.indexOf(":");
+  if (separator <= 0 || separator !== value.lastIndexOf(":")) {
+    return null;
+  }
+  const provider = value.slice(0, separator);
+  const runId = safeUuid(value.slice(separator + 1));
+  return PROVIDERS.includes(provider as AgentProvider) && runId
+    ? { provider: provider as AgentProvider, runId }
+    : null;
 }
 
 function errorEnvelope(generatedAt: string, error: AgentSourceError): AgentsEnvelope {
@@ -616,315 +1110,168 @@ function errorEnvelope(generatedAt: string, error: AgentSourceError): AgentsEnve
   };
 }
 
-function makeDiagnostic(code: string, value: unknown): AgentSourceError {
-  const raw = value instanceof Error ? value.message : String(value);
+function cliError(
+  exitCode: number,
+  json: boolean,
+  envelope: AgentsEnvelope
+): AgentsCliResult {
   return {
-    code,
-    message: sanitizeDiagnostic(raw) || "Provider visibility failed without a safe diagnostic."
+    exitCode,
+    stdout: json ? JSON.stringify(envelope, null, 2) : "",
+    stderr: json ? "" : `error: ${envelope.error?.message ?? "Agent visibility failed."}`
   };
 }
 
-function sanitizeDiagnostic(value: unknown): string {
-  if (typeof value !== "string") {
-    return "";
+function formatTaskGoal(agent: AgentRecord): string {
+  const shortId = safeShortId(agent.task.short_id);
+  if (shortId) {
+    return shortId;
   }
-  return bound(
-    redactVisibilitySecrets(value)
-      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]")
-      .replace(/\/(?:home|Users)\/[^/\s]+/g, "~")
-      .replace(/[\u0000-\u001f\u007f]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim(),
-    200
+  const taskId = safeUuid(agent.task.id);
+  if (taskId) {
+    return taskId;
+  }
+  const goalId = safeUuid(agent.goal.id);
+  if (goalId) {
+    return goalId;
+  }
+  return "—";
+}
+
+function formatAgentDetails(agent: AgentRecord, sources: AgentSource[]): string {
+  const safeStatus = safeOutputStatus(agent.status);
+  const safeGaps = agent.gaps.filter((gap) => SAFE_GAP_NAMES.has(gap)).sort();
+  return [
+    `Agent: ${safeOutputAgentId(agent.id)}`,
+    `Status: ${safeStatus} (${agent.active && ACTIVE_STATUSES.has(safeStatus) ? "active" : "inactive"})`,
+    `Started: ${safeOutputTimestamp(agent.started_at)}`,
+    `Updated: ${safeOutputTimestamp(agent.updated_at)}`,
+    "Worktree: —",
+    "Branch: —",
+    `Task: ${formatTaskGoal(agent)}`,
+    `Goal: ${safeUuid(agent.goal.id) ?? "—"}`,
+    "Last tool: —",
+    `Profile: ${safeProfileAlias(agent.profile.alias) ?? "—"}`,
+    `Freshness: ${safeOutputTimestamp(agent.freshness_at)}`,
+    `Gaps: ${safeGaps.length > 0 ? safeGaps.join(", ") : "none"}`,
+    "Sources:",
+    ...sources.flatMap((source) =>
+      PROVIDERS.includes(source.provider)
+        ? [
+            `  ${source.provider}: ${safeSourceStatus(source.status)}${
+              source.error ? ` (${safeDiagnosticCode(source.error.code)})` : ""
+            }`
+          ]
+        : []
+    )
+  ].join("\n");
+}
+
+function safeOutputAgentId(value: unknown): string {
+  if (typeof value !== "string") {
+    return "—";
+  }
+  const parsed = parseAgentId(value);
+  return parsed && `${parsed.provider}:${parsed.runId}` === value ? value : "—";
+}
+
+function safeOutputStatus(value: unknown): string {
+  return normalizeStatus(value).value;
+}
+
+function safeOutputTimestamp(value: unknown): string {
+  if (typeof value !== "string") {
+    return "—";
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) &&
+    parsed >= EARLIEST_VALID_TIME_MS &&
+    parsed <= Date.now() &&
+    new Date(parsed).toISOString() === value
+    ? value
+    : "—";
+}
+
+function safeSourceStatus(value: unknown): AgentSourceStatus {
+  return value === "ok" ||
+    value === "partial" ||
+    value === "unavailable" ||
+    value === "error"
+    ? value
+    : "error";
+}
+
+function safeDiagnosticCode(value: unknown): string {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_CODES.has(value)
+    ? value
+    : "diagnostic-withheld";
+}
+
+function fitCell(value: string, width: number): string {
+  const graphemes = [...new Intl.Segmenter("en", { granularity: "grapheme" }).segment(value)].map(
+    ({ segment }) => segment
   );
+  const fitted =
+    graphemes.length <= width
+      ? value
+      : `${graphemes.slice(0, Math.max(0, width - 1)).join("")}…`;
+  const fittedLength = [
+    ...new Intl.Segmenter("en", { granularity: "grapheme" }).segment(fitted)
+  ].length;
+  return fitted.padEnd(fitted.length + Math.max(0, width - fittedLength), " ");
 }
 
-function boundedText(value: unknown, maximum: number): string | null {
-  if (typeof value !== "string") {
-    return null;
+function safeNow(now: () => Date): string {
+  const value = now();
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    return new Date(0).toISOString();
   }
-  const sanitized = redactVisibilitySecrets(value)
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]")
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return sanitized ? bound(sanitized, maximum) : null;
+  return value.toISOString();
 }
 
-function safeOpaqueId(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return /^[A-Za-z0-9._-]{1,256}$/.test(trimmed) && redactVisibilitySecrets(trimmed) === trimmed
-    ? trimmed
-    : null;
-}
-
-function safeProfileAlias(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  if (
-    !/^[A-Za-z][A-Za-z0-9._-]{0,31}$/.test(trimmed) ||
-    /^(?:sk|gh[pousr]|token|secret|key|auth|cred)[._-]/i.test(trimmed) ||
-    /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(trimmed) ||
-    redactVisibilitySecrets(trimmed) !== trimmed
-  ) {
-    return null;
-  }
-  return trimmed;
-}
-
-function redactVisibilitySecrets(value: string): string {
-  return redactSensitiveText(value)
-    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
-    .replace(/\bsk-ant-[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_ANTHROPIC_KEY]")
-    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED_JWT]")
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]")
-    .replace(/(https?:\/\/)[^/\s:@]+:[^@\s]+@/gi, "$1[REDACTED]@");
-}
-
-function safeAbsolutePath(value: unknown): string | null {
-  if (typeof value !== "string" || !isAbsolute(value) || value.length > 512) {
-    return null;
-  }
-  if (
-    /(?:^|\/)\.(?:ssh|aws|config|codewith|claude)(?:\/|$)/i.test(value) ||
-    /(?:^|\/)(?:secrets?|credentials?)(?:\/|$)/i.test(value) ||
-    /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value) ||
-    redactVisibilitySecrets(value) !== value ||
-    /[\u0000-\u001f\u007f]/.test(value)
-  ) {
-    return null;
-  }
-  return value;
-}
-
-function safeBranch(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return /^[A-Za-z0-9._/-]{1,200}$/.test(trimmed) && redactVisibilitySecrets(trimmed) === trimmed
-    ? trimmed
-    : null;
-}
-
-function normalizeTimestamp(value: unknown): string | null {
-  let milliseconds: number;
-  if (typeof value === "number" && Number.isFinite(value)) {
-    milliseconds = value > 10_000_000_000 ? value : value * 1000;
-  } else if (typeof value === "string" && value.trim()) {
-    const numeric = Number(value);
-    milliseconds = Number.isFinite(numeric)
-      ? numeric > 10_000_000_000
-        ? numeric
-        : numeric * 1000
-      : Date.parse(value);
-  } else {
-    return null;
-  }
-  if (!Number.isFinite(milliseconds)) {
-    return null;
-  }
-  const date = new Date(milliseconds);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-function latestTimestamp(...values: unknown[]): string | null {
-  const timestamps = values
-    .map(normalizeTimestamp)
-    .filter((value): value is string => value !== null)
-    .sort((left, right) => Date.parse(right) - Date.parse(left));
-  return timestamps[0] ?? null;
-}
-
-function isTerminalStatus(status: string): boolean {
-  return /^(?:cancelled|completed|done|failed|stopped|terminated|archived|succeeded)$/i.test(status);
-}
-
-function isActiveStatus(status: string): boolean {
-  return !isTerminalStatus(status);
-}
-
-function emptyLastToolCall(): AgentRecord["last_tool_call"] {
-  return { name: null, at: null, summary: null };
-}
-
-function emptyGoal(): AgentRecord["goal"] {
-  return { id: null, title: null, status: null };
-}
-
-function emptyTask(): AgentRecord["task"] {
-  return { id: null, short_id: null, title: null, status: null };
+function positiveBound(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function bound(value: string, maximum: number): string {
-  if (value.length <= maximum) {
-    return value;
-  }
-  return `${value.slice(0, Math.max(0, maximum - 1))}…`;
-}
+const NONPRINTING_PATTERN =
+  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u0080-\u009f\u200b\u202a-\u202e\u2066-\u2069]/u;
 
-function parseAgentsArguments(args: string[]): ParsedAgentsArguments {
-  let json = false;
-  let limit = DEFAULT_AGENTS_LIMIT;
-  const positionals: string[] = [];
+const SAFE_GAP_NAMES = new Set([
+  "branch",
+  "freshness_at",
+  "goal.id",
+  "goal.status",
+  "goal.title",
+  "last_tool_call.at",
+  "last_tool_call.name",
+  "last_tool_call.summary",
+  "profile.alias",
+  "started_at",
+  "status",
+  "task.short_id",
+  "task.status",
+  "task.title",
+  "updated_at",
+  "worktree"
+]);
 
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index] ?? "";
-    if (argument === "--json") {
-      json = true;
-      continue;
-    }
-    if (argument === "--limit") {
-      const value = args[index + 1];
-      if (!value) {
-        throw new Error("--limit requires an integer.");
-      }
-      limit = parseLimit(value);
-      index += 1;
-      continue;
-    }
-    if (argument.startsWith("--limit=")) {
-      limit = parseLimit(argument.slice("--limit=".length));
-      continue;
-    }
-    if (argument.startsWith("-")) {
-      throw new Error(`Unknown option: ${argument}`);
-    }
-    positionals.push(argument);
-  }
-
-  if (positionals.length === 0 || (positionals.length === 1 && positionals[0] === "list")) {
-    return { json, limit, mode: "list", id: null };
-  }
-  if (positionals[0] === "show" && positionals.length === 2) {
-    return { json, limit, mode: "show", id: positionals[1] ?? null };
-  }
-  throw new Error("Usage: tai agents [--json] [--limit <1-200>] | tai agents show <provider>:<run-id> [--json]");
-}
-
-function parseLimit(value: string): number {
-  if (!/^\d+$/.test(value)) {
-    throw new Error("--limit must be an integer between 1 and 200.");
-  }
-  const parsed = Number(value);
-  if (parsed < 1 || parsed > MAX_AGENTS_LIMIT) {
-    throw new Error("--limit must be between 1 and 200.");
-  }
-  return parsed;
-}
-
-function isValidAgentId(value: string | null): value is string {
-  if (!value) {
-    return false;
-  }
-  const separator = value.indexOf(":");
-  if (separator <= 0 || separator === value.length - 1) {
-    return false;
-  }
-  const provider = value.slice(0, separator);
-  const runId = value.slice(separator + 1);
-  return (
-    (provider === "codewith" || provider === "claude" || provider === "todos") &&
-    safeOpaqueId(runId) === runId
-  );
-}
-
-function formatTaskGoal(agent: AgentRecord): string {
-  if (agent.task.id) {
-    return bound(`${agent.task.short_id ?? agent.task.id} ${agent.task.title ?? ""}`.trim(), 30);
-  }
-  if (agent.goal.id) {
-    return bound(`${agent.goal.id} ${agent.goal.title ?? ""}`.trim(), 30);
-  }
-  return "—";
-}
-
-function formatAgentDetails(agent: AgentRecord, sources: AgentSource[]): string {
-  const sourceLines = sources.map(
-    (source) =>
-      `  ${source.provider}: ${source.status}${source.error ? ` (${source.error.code})` : ""}`
-  );
-  return [
-    `Agent: ${agent.id}`,
-    `Status: ${agent.status} (${agent.active ? "active" : "inactive"})`,
-    `Started: ${agent.started_at ?? "—"}`,
-    `Updated: ${agent.updated_at ?? "—"}`,
-    `Worktree: ${agent.worktree ?? "—"}`,
-    `Branch: ${agent.branch ?? "—"}`,
-    `Task: ${agent.task.id ? `${agent.task.short_id ?? agent.task.id} ${agent.task.title ?? ""}`.trim() : "—"}`,
-    `Goal: ${agent.goal.id ? `${agent.goal.id} ${agent.goal.title ?? ""}`.trim() : "—"}`,
-    `Last tool: ${agent.last_tool_call.name ?? "—"}`,
-    `Profile: ${agent.profile.alias ?? "—"}`,
-    `Freshness: ${agent.freshness_at ?? "—"}`,
-    `Gaps: ${agent.gaps.length > 0 ? agent.gaps.join("; ") : "none"}`,
-    "Sources:",
-    ...sourceLines
-  ].join("\n");
-}
-
-function padCell(value: string, width: number): string {
-  return bound(value, width).padEnd(width, " ");
-}
-
-async function runProviderCommand(command: ProviderCommand): Promise<ProviderCommandResult> {
-  return await new Promise((resolve) => {
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
-    let failure: ProviderCommandResult["failure"];
-    let resolved = false;
-    const child = spawn(command.command, command.args, {
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-
-    const finish = (exitCode: number | null): void => {
-      if (resolved) {
-        return;
-      }
-      resolved = true;
-      clearTimeout(timer);
-      resolve({
-        stdout: stdout.toString("utf8"),
-        stderr: stderr.toString("utf8"),
-        exitCode,
-        ...(failure ? { failure } : {})
-      });
-    };
-
-    const timer = setTimeout(() => {
-      failure = "timeout";
-      child.kill("SIGKILL");
-    }, PROVIDER_TIMEOUT_MS);
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (stdout.length + chunk.length > MAX_STDOUT_BYTES) {
-        failure = "output-limit";
-        child.kill("SIGKILL");
-        return;
-      }
-      stdout = Buffer.concat([stdout, chunk]);
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      const remaining = MAX_STDERR_BYTES - stderr.length;
-      if (remaining > 0) {
-        stderr = Buffer.concat([stderr, chunk.subarray(0, remaining)]);
-      }
-    });
-
-    child.on("error", (error: NodeJS.ErrnoException) => {
-      failure = error.code === "ENOENT" ? "not-found" : "spawn-error";
-      finish(null);
-    });
-    child.on("close", (exitCode) => finish(exitCode));
-  });
-}
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "agent-provenance-missing",
+  "diagnostic-withheld",
+  "normalized-fields-unavailable",
+  "provider-http-error",
+  "provider-identity-mismatch",
+  "provider-invalid-json",
+  "provider-invalid-payload",
+  "provider-network-error",
+  "provider-output-limit",
+  "provider-timeout",
+  "record-withheld",
+  "result-limit-applied",
+  "side-effect-free-source-limit-unavailable",
+  "side-effect-free-surface-unavailable"
+]);
