@@ -1,31 +1,33 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 
 export const AGENTS_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_AGENTS_LIMIT = 50;
 export const MAX_AGENTS_LIMIT = 200;
 
-const DEFAULT_HTTP_TIMEOUT_MS = 5_000;
-const DEFAULT_HTTP_BYTES = 1024 * 1024;
 const DEFAULT_PROCESS_TIMEOUT_MS = 15_000;
 const DEFAULT_PROCESS_STDOUT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_PROCESS_STDERR_BYTES = 16 * 1024;
+const PROCESS_TERMINATION_RESERVE_MS = 250;
 const EARLIEST_VALID_TIME_MS = Date.parse("2000-01-01T00:00:00.000Z");
+const RFC3339_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
 
 const PROVIDERS = ["codewith", "claude", "todos"] as const;
 const ACTIVE_STATUSES = new Set(["idle", "in_progress", "running"]);
-const STATUS_PRECEDENCE: Readonly<Record<string, number>> = {
-  running: 80,
-  in_progress: 70,
-  idle: 60,
-  blocked: 50,
-  pending: 40,
-  succeeded: 30,
-  completed: 30,
-  failed: 20,
-  stopped: 10,
-  cancelled: 10,
-  unknown: 0
-};
+const STATUS_PRECEDENCE = new Map<string, number>([
+  ["running", 80],
+  ["in_progress", 70],
+  ["idle", 60],
+  ["blocked", 50],
+  ["pending", 40],
+  ["succeeded", 30],
+  ["completed", 30],
+  ["failed", 20],
+  ["stopped", 10],
+  ["cancelled", 10]
+]);
 
 export type AgentProvider = (typeof PROVIDERS)[number];
 export type AgentSourceStatus = "ok" | "partial" | "unavailable" | "error";
@@ -152,11 +154,6 @@ interface ProviderCollection {
   agents: AgentRecord[];
 }
 
-interface TodosConfig {
-  baseUrl: URL;
-  apiKey: string | null;
-}
-
 interface NormalizedStatus {
   value: string;
   active: boolean;
@@ -170,7 +167,7 @@ export async function collectAgentVisibility(
   const generatedAt = safeNow(now);
   const limit = validateLimit(options.limit ?? DEFAULT_AGENTS_LIMIT);
   const collections = await Promise.all(
-    PROVIDERS.map((provider) => collectProvider(provider, null, options, now))
+    PROVIDERS.map((provider) => collectProvider(provider, null))
   );
   const sources = collections.map(({ source }) => source);
   const allAgents = sortAgents(dedupeAgents(collections.flatMap(({ agents }) => agents)));
@@ -232,7 +229,7 @@ export async function runAgentsCli(
   }
 
   if (parsed.mode === "show" && parsedId) {
-    const collection = await collectProvider(parsedId.provider, parsedId.runId, options, now);
+    const collection = await collectProvider(parsedId.provider, parsedId.runId);
     const envelope: AgentsEnvelope = {
       schema_version: AGENTS_SCHEMA_VERSION,
       generated_at: generatedAt,
@@ -307,7 +304,7 @@ export function formatAgentsTable(envelope: AgentsEnvelope): string {
   ];
   const rows = envelope.agents.map((agent) => {
     const status = safeOutputStatus(agent.status);
-    const active = agent.active && ACTIVE_STATUSES.has(status);
+    const active = isSafelyActive(agent);
     return [
       `${active ? "active" : "inactive"}:${status}`,
       safeOutputAgentId(agent.id),
@@ -361,8 +358,10 @@ export function dedupeAgents(agents: AgentRecord[]): AgentRecord[] {
 
 export function sortAgents(agents: AgentRecord[]): AgentRecord[] {
   return [...agents].sort((left, right) => {
-    if (left.active !== right.active) {
-      return left.active ? -1 : 1;
+    const leftActive = isSafelyActive(left);
+    const rightActive = isSafelyActive(right);
+    if (leftActive !== rightActive) {
+      return leftActive ? -1 : 1;
     }
     const observationOrder = compareObservationTime(left, right);
     if (observationOrder !== 0) {
@@ -389,10 +388,24 @@ export async function runBoundedProviderProcess(
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     let settled = false;
+    let terminating = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let cleanupTimer: ReturnType<typeof setTimeout> | null = null;
+    let descendantTimer: ReturnType<typeof setInterval> | null = null;
+    const trackedDescendants = new Map<number, string>();
+    const scopeId = randomUUID();
+    const cleanupGraceMs = Math.min(50, Math.max(1, Math.floor(timeoutMs / 4)));
+    const terminationReserveMs =
+      timeoutMs >= 1_000
+        ? Math.min(PROCESS_TERMINATION_RESERVE_MS, Math.max(1, timeoutMs - 1))
+        : cleanupGraceMs;
     const child = spawn(request.command, request.args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
-      env: request.env ?? process.env,
+      env: {
+        ...(request.env ?? process.env),
+        TAI_PROVIDER_PROCESS_SCOPE: scopeId
+      },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -405,7 +418,15 @@ export async function runBoundedProviderProcess(
         return;
       }
       settled = true;
-      clearTimeout(timer);
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+      if (cleanupTimer) {
+        clearTimeout(cleanupTimer);
+      }
+      if (descendantTimer) {
+        clearInterval(descendantTimer);
+      }
       resolve({
         stdout: stdout.toString("utf8"),
         stderr: stderr.toString("utf8"),
@@ -414,10 +435,23 @@ export async function runBoundedProviderProcess(
       });
     };
 
-    const terminateGroup = (failure: "output-limit" | "timeout"): void => {
-      if (settled) {
+    const finishTermination = (
+      failure: "output-limit" | "timeout",
+      knownDescendants: number[]
+    ): void => {
+      if (settled || !terminating) {
         return;
       }
+      const descendants = child.pid
+        ? [
+            ...new Set([
+              ...knownDescendants,
+              ...collectDescendantPids(child.pid)
+            ])
+          ]
+        : knownDescendants;
+      killPids(descendants);
+      killTrackedPids(trackedDescendants);
       if (child.pid && process.platform !== "win32") {
         try {
           process.kill(-child.pid, "SIGKILL");
@@ -436,18 +470,61 @@ export async function runBoundedProviderProcess(
       finish(null, failure);
     };
 
-    const timer = setTimeout(() => terminateGroup("timeout"), timeoutMs);
+    const beginTermination = (failure: "output-limit" | "timeout"): void => {
+      if (settled || terminating) {
+        return;
+      }
+      terminating = true;
+      if (child.pid && process.platform !== "win32") {
+        try {
+          process.kill(-child.pid, "SIGSTOP");
+        } catch {
+          // The process group may already be gone.
+        }
+      }
+      if (timeoutMs >= 1_000) {
+        mergeTrackedPids(trackedDescendants, collectScopedProcesses(scopeId));
+      }
+      const descendants = child.pid
+        ? collectDescendantPids(child.pid)
+        : [];
+      killPids(descendants);
+      killTrackedPids(trackedDescendants);
+      cleanupTimer = setTimeout(
+        () => finishTermination(failure, descendants),
+        cleanupGraceMs
+      );
+    };
+
+    deadlineTimer = setTimeout(
+      () => beginTermination("timeout"),
+      Math.max(1, timeoutMs - terminationReserveMs)
+    );
+    const trackDescendants = (): void => {
+      if (!child.pid || terminating) {
+        return;
+      }
+      for (const pid of collectDescendantPids(child.pid)) {
+        const startTime = readProcessStartTime(pid);
+        if (startTime) {
+          trackedDescendants.set(pid, startTime);
+        }
+      }
+    };
+    trackDescendants();
+    descendantTimer = setInterval(trackDescendants, 2);
+    descendantTimer.unref();
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (stdout.length + chunk.length > maxStdoutBytes) {
-        terminateGroup("output-limit");
+        beginTermination("output-limit");
         return;
       }
       stdout = Buffer.concat([stdout, chunk]);
     });
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length + chunk.length > maxStderrBytes) {
-        terminateGroup("output-limit");
+        beginTermination("output-limit");
         return;
       }
       stderr = Buffer.concat([stderr, chunk]);
@@ -455,15 +532,141 @@ export async function runBoundedProviderProcess(
     child.on("error", (error: NodeJS.ErrnoException) => {
       finish(null, error.code === "ENOENT" ? "not-found" : "spawn-error");
     });
-    child.on("close", (exitCode) => finish(exitCode));
+    child.on("close", (exitCode) => {
+      if (!terminating) {
+        terminating = true;
+        mergeTrackedPids(trackedDescendants, collectScopedProcesses(scopeId));
+        killTrackedPids(trackedDescendants);
+        cleanupTimer = setTimeout(() => {
+          finish(exitCode);
+        }, cleanupGraceMs);
+      }
+    });
   });
+}
+
+function collectDescendantPids(rootPid: number): number[] {
+  if (process.platform !== "linux") {
+    return [];
+  }
+  const pending = [rootPid];
+  const seen = new Set<number>([rootPid]);
+  const descendants: number[] = [];
+  while (pending.length > 0) {
+    const parentPid = pending.shift();
+    if (!parentPid) {
+      continue;
+    }
+    let children = "";
+    try {
+      children = readFileSync(
+        `/proc/${parentPid}/task/${parentPid}/children`,
+        "utf8"
+      );
+    } catch {
+      continue;
+    }
+    for (const token of children.trim().split(/\s+/)) {
+      const childPid = Number(token);
+      if (
+        !Number.isSafeInteger(childPid) ||
+        childPid <= 1 ||
+        childPid === process.pid ||
+        seen.has(childPid)
+      ) {
+        continue;
+      }
+      seen.add(childPid);
+      descendants.push(childPid);
+      pending.push(childPid);
+    }
+  }
+  return descendants.reverse();
+}
+
+function readProcessStartTime(pid: number): string | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    return fields[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function collectScopedProcesses(scopeId: string): Map<number, string> {
+  const matches = new Map<number, string>();
+  if (process.platform !== "linux") {
+    return matches;
+  }
+  const marker = Buffer.from(`TAI_PROVIDER_PROCESS_SCOPE=${scopeId}\0`);
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return matches;
+  }
+  for (const entry of entries) {
+    if (!/^[0-9]+$/.test(entry)) {
+      continue;
+    }
+    const pid = Number(entry);
+    if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) {
+      continue;
+    }
+    let environment: Buffer | null = null;
+    try {
+      environment = readFileSync(`/proc/${pid}/environ`);
+      if (!environment.includes(marker)) {
+        continue;
+      }
+      const startTime = readProcessStartTime(pid);
+      if (startTime) {
+        matches.set(pid, startTime);
+      }
+    } catch {
+      // The process may have exited or may not expose its environment.
+    } finally {
+      environment?.fill(0);
+    }
+  }
+  return matches;
+}
+
+function mergeTrackedPids(
+  target: Map<number, string>,
+  source: ReadonlyMap<number, string>
+): void {
+  for (const [pid, startTime] of source) {
+    target.set(pid, startTime);
+  }
+}
+
+function killTrackedPids(tracked: ReadonlyMap<number, string>): void {
+  for (const [pid, expectedStartTime] of tracked) {
+    if (readProcessStartTime(pid) !== expectedStartTime) {
+      continue;
+    }
+    killPids([pid]);
+  }
+}
+
+function killPids(pids: number[]): void {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // A descendant may have exited between the process-tree snapshot and kill.
+    }
+  }
 }
 
 async function collectProvider(
   provider: AgentProvider,
-  exactRunId: string | null,
-  options: CollectAgentsOptions,
-  now: () => Date
+  exactRunId: string | null
 ): Promise<ProviderCollection> {
   if (provider === "codewith" || provider === "claude") {
     return unsupportedCollection(
@@ -472,14 +675,10 @@ async function collectProvider(
       `No side-effect-free structured ${provider} agent read surface is configured.`
     );
   }
-  return await collectTodos(exactRunId, options, now);
+  return collectTodos(exactRunId);
 }
 
-async function collectTodos(
-  exactRunId: string | null,
-  options: CollectAgentsOptions,
-  now: () => Date
-): Promise<ProviderCollection> {
+function collectTodos(exactRunId: string | null): ProviderCollection {
   if (!exactRunId) {
     return unsupportedCollection(
       "todos",
@@ -487,274 +686,10 @@ async function collectTodos(
       "Todos has no side-effect-free source-level bounded list surface."
     );
   }
-  const env = options.env ?? process.env;
-  const config = resolveTodosConfig(env);
-  if (!config) {
-    return unsupportedCollection(
-      "todos",
-      "side-effect-free-surface-unavailable",
-      "No side-effect-free Todos API is configured."
-    );
-  }
-
-  const url = buildTodosUrl(config.baseUrl, exactRunId);
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (config.apiKey) {
-    headers["x-api-key"] = config.apiKey;
-  }
-  const result = await (options.httpRunner ?? runBoundedHttpRequest)({
-    provider: "todos",
-    method: "GET",
-    url,
-    headers,
-    timeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
-    maxBytes: DEFAULT_HTTP_BYTES
-  });
-  const observedAt = safeNow(now);
-
-  if (result.failure) {
-    const failureMessages: Record<
-      NonNullable<ProviderHttpResult["failure"]>,
-      AgentSourceError
-    > = {
-      "network-error": {
-        code: "provider-network-error",
-        message: "The side-effect-free Todos API request failed."
-      },
-      "output-limit": {
-        code: "provider-output-limit",
-        message: "The side-effect-free Todos API exceeded the response byte limit."
-      },
-      timeout: {
-        code: "provider-timeout",
-        message: "The side-effect-free Todos API exceeded the wall-clock limit."
-      }
-    };
-    return failedCollection("todos", observedAt, failureMessages[result.failure]);
-  }
-
-  if (exactRunId && result.status === 404) {
-    return {
-      source: {
-        provider: "todos",
-        status: "ok",
-        freshness_at: observedAt,
-        coverage: {
-          complete: true,
-          provider_records: 0,
-          projected_records: 0,
-          dropped_records: 0
-        }
-      },
-      agents: []
-    };
-  }
-
-  if (result.status === null || result.status < 200 || result.status >= 300) {
-    return failedCollection("todos", observedAt, {
-      code: "provider-http-error",
-      message: "The side-effect-free Todos API returned a non-success status."
-    });
-  }
-
-  let payload: unknown;
-  try {
-    payload = JSON.parse(result.body) as unknown;
-  } catch {
-    return failedCollection("todos", observedAt, {
-      code: "provider-invalid-json",
-      message: "The side-effect-free Todos API returned invalid JSON."
-    });
-  }
-
-  return normalizeTodosExact(payload, exactRunId, observedAt);
-}
-
-function normalizeTodosExact(
-  payload: unknown,
-  exactRunId: string,
-  observedAt: string
-): ProviderCollection {
-  if (!isRecord(payload) || !isRecord(payload.task)) {
-    return failedCollection("todos", observedAt, {
-      code: "provider-invalid-payload",
-      message: "The side-effect-free Todos API returned an unsupported exact record."
-    });
-  }
-  const raw = payload.task;
-  if (safeUuid(raw.id) !== exactRunId) {
-    return failedCollection("todos", observedAt, {
-      code: "provider-identity-mismatch",
-      message: "The side-effect-free Todos API returned a different exact record."
-    });
-  }
-  if (!hasTodosAgentProvenance(raw, observedAt)) {
-    return {
-      source: {
-        provider: "todos",
-        status: "partial",
-        freshness_at: observedAt,
-        coverage: {
-          complete: true,
-          provider_records: 1,
-          projected_records: 0,
-          dropped_records: 1
-        },
-        error: {
-          code: "agent-provenance-missing",
-          message: "The exact Todos task has no authoritative agent, session, or live lease provenance."
-        }
-      },
-      agents: []
-    };
-  }
-  const record = normalizeTodosTask(raw, observedAt);
-  if (!record) {
-    return {
-      source: {
-        provider: "todos",
-        status: "partial",
-        freshness_at: observedAt,
-        coverage: {
-          complete: false,
-          provider_records: 1,
-          projected_records: 0,
-          dropped_records: 1
-        },
-        error: {
-          code: "record-withheld",
-          message: "The exact Todos record did not satisfy the safe-output contract."
-        }
-      },
-      agents: []
-    };
-  }
-  const incomplete = record.gaps.length > 0;
-  return {
-    source: {
-      provider: "todos",
-      status: incomplete ? "partial" : "ok",
-      freshness_at: observedAt,
-      coverage: {
-        complete: true,
-        provider_records: 1,
-        projected_records: 1,
-        dropped_records: 0
-      },
-      ...(incomplete
-        ? {
-            error: {
-              code: "normalized-fields-unavailable",
-              message: "The exact Todos record has explicit unavailable normalized fields."
-            }
-          }
-        : {})
-    },
-    agents: [record]
-  };
-}
-
-function normalizeTodosTask(
-  raw: Record<string, unknown>,
-  observedAt: string
-): AgentRecord | null {
-  const runId = safeUuid(raw.id);
-  if (!runId) {
-    return null;
-  }
-  const observedAtMs = Date.parse(observedAt);
-  const status = normalizeStatus(raw.status);
-  let startedAt = normalizeTimestamp(raw.started_at ?? raw.created_at, observedAtMs);
-  const updatedAt = normalizeTimestamp(raw.updated_at ?? raw.synced_at, observedAtMs);
-  if (startedAt && updatedAt && Date.parse(startedAt) > Date.parse(updatedAt)) {
-    startedAt = null;
-  }
-  const metadata = isRecord(raw.metadata) ? raw.metadata : {};
-  const shortId = safeShortId(raw.short_id);
-  const profileAlias = safeProfileAlias(raw.profile_alias ?? metadata.profile_alias);
-  const gaps: string[] = [];
-
-  if (!status.complete) gaps.push("status");
-  if (!startedAt) gaps.push("started_at");
-  if (!updatedAt) gaps.push("updated_at");
-  gaps.push(
-    "worktree",
-    "branch",
-    "last_tool_call.name",
-    "last_tool_call.at",
-    "last_tool_call.summary",
-    "goal.id",
-    "goal.title",
-    "goal.status"
-  );
-  if (!shortId) gaps.push("task.short_id");
-  gaps.push("task.title");
-  if (!status.complete) gaps.push("task.status");
-  if (!profileAlias) gaps.push("profile.alias");
-  if (!updatedAt) gaps.push("freshness_at");
-
-  return {
-    id: `todos:${runId}`,
-    provider: "todos",
-    run_id: runId,
-    status: status.value,
-    active: status.active,
-    started_at: startedAt,
-    updated_at: updatedAt,
-    worktree: null,
-    branch: null,
-    last_tool_call: { name: null, at: null, summary: null },
-    goal: { id: null, title: null, status: null },
-    task: {
-      id: runId,
-      short_id: shortId,
-      title: null,
-      status: status.complete ? status.value : null
-    },
-    profile: { alias: profileAlias },
-    freshness_at: updatedAt,
-    gaps: [...new Set(gaps)].sort()
-  };
-}
-
-function hasTodosAgentProvenance(
-  raw: Record<string, unknown>,
-  observedAt: string
-): boolean {
-  const metadata = isRecord(raw.metadata) ? raw.metadata : {};
-  const directValues = [
-    raw.agent_id,
-    raw.session_id,
-    raw.runner_id,
-    metadata.agent_id,
-    metadata.session_id,
-    metadata.run_id
-  ];
-  if (directValues.some(hasOpaqueProvenanceValue)) {
-    return true;
-  }
-
-  const leaseOwner = raw.locked_by ?? metadata.locked_by;
-  const leaseExpiry = raw.lock_expires_at ?? metadata.lock_expires_at;
-  if (!hasOpaqueProvenanceValue(leaseOwner)) {
-    return false;
-  }
-  const expiryMs = parseTimestampMs(leaseExpiry);
-  const observedMs = Date.parse(observedAt);
-  return (
-    expiryMs !== null &&
-    expiryMs >= observedMs &&
-    expiryMs <= observedMs + 24 * 60 * 60 * 1000
-  );
-}
-
-function hasOpaqueProvenanceValue(value: unknown): boolean {
-  return (
-    typeof value === "string" &&
-    value.length >= 1 &&
-    value.length <= 256 &&
-    value.trim() === value &&
-    !NONPRINTING_PATTERN.test(value)
+  return unsupportedCollection(
+    "todos",
+    "side-effect-free-surface-unavailable",
+    "Todos has no demonstrably side-effect-free structured exact-read surface."
   );
 }
 
@@ -763,7 +698,7 @@ function normalizeStatus(value: unknown): NormalizedStatus {
     return { value: "unknown", active: false, complete: false };
   }
   const candidate = value.trim().toLowerCase();
-  if (candidate === "unknown" || !(candidate in STATUS_PRECEDENCE)) {
+  if (candidate === "unknown" || !STATUS_PRECEDENCE.has(candidate)) {
     return { value: "unknown", active: false, complete: false };
   }
   return {
@@ -773,32 +708,41 @@ function normalizeStatus(value: unknown): NormalizedStatus {
   };
 }
 
-function normalizeTimestamp(value: unknown, observedAtMs: number): string | null {
-  const milliseconds = parseTimestampMs(value);
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const match = RFC3339_PATTERN.exec(value);
+  if (!match) {
+    return null;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const zone = match[8] ?? "";
   if (
-    milliseconds === null ||
-    milliseconds < EARLIEST_VALID_TIME_MS ||
-    milliseconds > observedAtMs
+    year < 2000 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > new Date(Date.UTC(year, month, 0)).getUTCDate() ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
   ) {
     return null;
   }
-  return new Date(milliseconds).toISOString();
-}
-
-function parseTimestampMs(value: unknown): number | null {
-  let milliseconds: number;
-  if (typeof value === "number" && Number.isFinite(value)) {
-    milliseconds = value > 10_000_000_000 ? value : value * 1000;
-  } else if (typeof value === "string" && value.trim() !== "") {
-    const numeric = Number(value);
-    milliseconds = Number.isFinite(numeric)
-      ? numeric > 10_000_000_000
-        ? numeric
-        : numeric * 1000
-      : Date.parse(value);
-  } else {
-    return null;
+  if (zone !== "Z") {
+    const zoneHour = Number(zone.slice(1, 3));
+    const zoneMinute = Number(zone.slice(4, 6));
+    if (zoneHour > 23 || zoneMinute > 59) {
+      return null;
+    }
   }
+  const milliseconds = Date.parse(value);
   return Number.isFinite(milliseconds) ? milliseconds : null;
 }
 
@@ -806,11 +750,10 @@ function safeUuid(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
   }
-  const candidate = value.toLowerCase();
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
-    candidate
+    value
   )
-    ? candidate
+    ? value
     : null;
 }
 
@@ -826,48 +769,6 @@ function safeProfileAlias(value: unknown): string | null {
     return null;
   }
   return /^account[0-9]{3}$/.test(value) ? value : null;
-}
-
-function resolveTodosConfig(
-  env: Readonly<Record<string, string | undefined>>
-): TodosConfig | null {
-  const rawBaseUrl = env.TODOS_URL ?? env.TODOS_API_URL;
-  if (!rawBaseUrl) {
-    return null;
-  }
-  let baseUrl: URL;
-  try {
-    baseUrl = new URL(rawBaseUrl);
-  } catch {
-    return null;
-  }
-  if (
-    (baseUrl.protocol !== "https:" &&
-      !(baseUrl.protocol === "http:" && isLoopbackHostname(baseUrl.hostname))) ||
-    baseUrl.username !== "" ||
-    baseUrl.password !== "" ||
-    baseUrl.search !== "" ||
-    baseUrl.hash !== ""
-  ) {
-    return null;
-  }
-  return {
-    baseUrl,
-    apiKey: env.TODOS_API_KEY || null
-  };
-}
-
-function isLoopbackHostname(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-}
-
-function buildTodosUrl(baseUrl: URL, exactRunId: string): string {
-  const url = new URL(baseUrl.toString());
-  const prefix = url.pathname.replace(/\/+$/, "");
-  url.pathname = `${prefix}/v1/tasks/${encodeURIComponent(exactRunId)}`;
-  url.search = "";
-  url.hash = "";
-  return url.toString();
 }
 
 export async function runBoundedHttpRequest(
@@ -943,28 +844,6 @@ function unsupportedCollection(
   };
 }
 
-function failedCollection(
-  provider: AgentProvider,
-  observedAt: string,
-  error: AgentSourceError
-): ProviderCollection {
-  return {
-    source: {
-      provider,
-      status: "error",
-      freshness_at: observedAt,
-      coverage: {
-        complete: false,
-        provider_records: null,
-        projected_records: 0,
-        dropped_records: null
-      },
-      error
-    },
-    agents: []
-  };
-}
-
 function applyResultLimitCoverage(
   sources: AgentSource[],
   allAgents: AgentRecord[],
@@ -1004,7 +883,8 @@ function compareObservations(left: AgentRecord, right: AgentRecord): number {
     return timeOrder;
   }
   const statusOrder =
-    (STATUS_PRECEDENCE[right.status] ?? 0) - (STATUS_PRECEDENCE[left.status] ?? 0);
+    (STATUS_PRECEDENCE.get(right.status) ?? 0) -
+    (STATUS_PRECEDENCE.get(left.status) ?? 0);
   if (statusOrder !== 0) {
     return statusOrder;
   }
@@ -1012,17 +892,32 @@ function compareObservations(left: AgentRecord, right: AgentRecord): number {
 }
 
 function compareObservationTime(left: AgentRecord, right: AgentRecord): number {
-  return observationTime(right) - observationTime(left);
+  const leftTime = observationTime(left);
+  const rightTime = observationTime(right);
+  if (leftTime === rightTime) {
+    return 0;
+  }
+  return leftTime > rightTime ? -1 : 1;
 }
 
 function observationTime(agent: AgentRecord): number {
   for (const value of [agent.updated_at, agent.freshness_at, agent.started_at]) {
-    const parsed = value ? Date.parse(value) : Number.NaN;
-    if (Number.isFinite(parsed)) {
+    const parsed = parseTimestampMs(value);
+    if (parsed !== null && parsed <= Date.now()) {
       return parsed;
     }
   }
   return Number.NEGATIVE_INFINITY;
+}
+
+function isSafelyActive(agent: AgentRecord): boolean {
+  const status = normalizeStatus(agent.status);
+  return (
+    agent.active &&
+    status.complete &&
+    status.active &&
+    observationTime(agent) !== Number.NEGATIVE_INFINITY
+  );
 }
 
 function canonicalRecord(agent: AgentRecord): string {
@@ -1141,9 +1036,10 @@ function formatTaskGoal(agent: AgentRecord): string {
 function formatAgentDetails(agent: AgentRecord, sources: AgentSource[]): string {
   const safeStatus = safeOutputStatus(agent.status);
   const safeGaps = agent.gaps.filter((gap) => SAFE_GAP_NAMES.has(gap)).sort();
+  const active = isSafelyActive(agent);
   return [
     `Agent: ${safeOutputAgentId(agent.id)}`,
-    `Status: ${safeStatus} (${agent.active && ACTIVE_STATUSES.has(safeStatus) ? "active" : "inactive"})`,
+    `Status: ${safeStatus} (${active ? "active" : "inactive"})`,
     `Started: ${safeOutputTimestamp(agent.started_at)}`,
     `Updated: ${safeOutputTimestamp(agent.updated_at)}`,
     "Worktree: —",
@@ -1180,15 +1076,11 @@ function safeOutputStatus(value: unknown): string {
 }
 
 function safeOutputTimestamp(value: unknown): string {
-  if (typeof value !== "string") {
-    return "—";
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) &&
+  const parsed = parseTimestampMs(value);
+  return parsed !== null &&
     parsed >= EARLIEST_VALID_TIME_MS &&
-    parsed <= Date.now() &&
-    new Date(parsed).toISOString() === value
-    ? value
+    parsed <= Date.now()
+    ? new Date(parsed).toISOString()
     : "—";
 }
 
@@ -1232,13 +1124,6 @@ function safeNow(now: () => Date): string {
 function positiveBound(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-const NONPRINTING_PATTERN =
-  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u0080-\u009f\u200b\u202a-\u202e\u2066-\u2069]/u;
 
 const SAFE_GAP_NAMES = new Set([
   "branch",

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
   runAgentsCli,
   runBoundedHttpRequest,
   runBoundedProviderProcess,
+  sortAgents,
   type AgentRecord,
   type ProviderHttpRequest,
   type ProviderHttpResult,
@@ -88,6 +89,24 @@ function sequenceNow(...values: Date[]): () => Date {
   return () => values[Math.min(index++, values.length - 1)] ?? REQUEST_AT;
 }
 
+function isProcessLive(pid: number): boolean {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2).charAt(0);
+      return state !== "Z" && state !== "X";
+    } catch {
+      return false;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function normalizedAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
   const id = overrides.run_id ?? uuid(1);
   return {
@@ -109,6 +128,277 @@ function normalizedAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
     ...overrides
   };
 }
+
+describe("final repair-cycle regressions", () => {
+  test("never calls the authenticated Todos HTTP surface, regardless of response semantics", async () => {
+    for (const result of [
+      exactResult(task(1)),
+      exactResult(task(1), 201),
+      exactResult(task(1), 206),
+      exactResult(task(1), 226),
+      { status: 302, body: "" },
+      { status: 404, body: "<html>not found</html>" }
+    ]) {
+      const http = fakeHttp(result);
+      const response = await runAgentsCli(["show", `todos:${uuid(1)}`, "--json"], {
+        env: TODOS_ENV,
+        httpRunner: http.runner,
+        now: fixedNow
+      });
+      const envelope = JSON.parse(response.stdout);
+
+      expect(http.calls).toHaveLength(0);
+      expect(response.exitCode).toBe(5);
+      expect(envelope.agents).toEqual([]);
+      expect(envelope.error.code).toBe("agent-lookup-incomplete");
+      expect(envelope.sources[0].status).toBe("unavailable");
+      expect(envelope.sources[0].coverage.complete).toBe(false);
+      expect(envelope.sources[0].error.code).toBe(
+        "side-effect-free-surface-unavailable"
+      );
+    }
+  });
+
+  test("prototype names are not recognized statuses and remain fail-closed", () => {
+    for (const status of ["constructor", "__proto__"]) {
+      const hostile = normalizedAgent({
+        id: `todos:${uuid(2)}`,
+        run_id: uuid(2),
+        status,
+        active: true,
+        started_at: null,
+        updated_at: null,
+        freshness_at: null,
+        task: { id: uuid(1), short_id: "E-00104", title: null, status },
+        gaps: ["status", "task.status"]
+      });
+      const output = formatAgentsTable({
+        schema_version: 1,
+        generated_at: REQUEST_AT.toISOString(),
+        partial: true,
+        sources: [],
+        agents: [hostile]
+      });
+
+      expect(output).toContain("inactive:unknown");
+      expect(output).not.toContain(status);
+      expect(hostile.gaps).toEqual(["status", "task.status"]);
+      const valid = normalizedAgent({
+        id: `todos:${uuid(1)}`,
+        run_id: uuid(1),
+        status: "completed",
+        active: false
+      });
+      expect(sortAgents([hostile, valid])).toEqual([valid, hostile]);
+    }
+  });
+
+  test("a stale printable agent_id never proves live Todos agent provenance", async () => {
+    const stale = task(1, {
+      agent_id: "printable-agent",
+      status: "running",
+      started_at: "2000-01-01T00:00:00.000Z",
+      updated_at: "2000-01-01T00:00:00.000Z",
+      locked_at: "2000-01-01T00:00:00.000Z"
+    });
+    const response = await runAgentsCli(["show", `todos:${uuid(1)}`, "--json"], {
+      env: TODOS_ENV,
+      httpRunner: fakeHttp(exactResult(stale)).runner,
+      now: fixedNow
+    });
+    const envelope = JSON.parse(response.stdout);
+
+    expect(response.exitCode).toBe(5);
+    expect(envelope.agents).toEqual([]);
+    expect(envelope.sources[0].status).toBe("unavailable");
+    expect(envelope.sources[0].coverage.complete).toBe(false);
+  });
+
+  test("rejects uppercase UUIDs as noncanonical before any provider execution", async () => {
+    const lowercase = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const http = fakeHttp(exactResult(task(1)));
+    const response = await runAgentsCli(
+      ["show", `todos:${lowercase.toUpperCase()}`, "--json"],
+      {
+        env: TODOS_ENV,
+        httpRunner: http.runner,
+        now: fixedNow
+      }
+    );
+
+    expect(response.exitCode).toBe(2);
+    expect(http.calls).toHaveLength(0);
+    expect(JSON.parse(response.stdout).agents).toEqual([]);
+  });
+
+  test("documents IPv6 loopback as unsupported without attempting a request", async () => {
+    const http = fakeHttp(exactResult(task(1)));
+    const response = await runAgentsCli(["show", `todos:${uuid(1)}`, "--json"], {
+      env: { TODOS_URL: "http://[::1]:43117" },
+      httpRunner: http.runner,
+      now: fixedNow
+    });
+    const envelope = JSON.parse(response.stdout);
+
+    expect(response.exitCode).toBe(5);
+    expect(http.calls).toHaveLength(0);
+    expect(envelope.sources[0].error.code).toBe(
+      "side-effect-free-surface-unavailable"
+    );
+  });
+
+  test("uses status and canonical tie-breakers when every timestamp is invalid", () => {
+    const running = normalizedAgent({
+      id: `todos:${uuid(1)}`,
+      run_id: uuid(1),
+      status: "running",
+      active: true,
+      started_at: null,
+      updated_at: null,
+      freshness_at: null,
+      profile: { alias: "account002" }
+    });
+    const completed = normalizedAgent({
+      id: `todos:${uuid(1)}`,
+      run_id: uuid(1),
+      status: "completed",
+      active: false,
+      started_at: null,
+      updated_at: null,
+      freshness_at: null,
+      profile: { alias: "account001" }
+    });
+    const first = normalizedAgent({
+      id: `todos:${uuid(2)}`,
+      run_id: uuid(2),
+      status: "completed",
+      active: false,
+      started_at: null,
+      updated_at: null,
+      freshness_at: null
+    });
+    const second = normalizedAgent({
+      id: `todos:${uuid(3)}`,
+      run_id: uuid(3),
+      status: "completed",
+      active: false,
+      started_at: null,
+      updated_at: null,
+      freshness_at: null
+    });
+
+    expect(dedupeAgents([running, completed])).toEqual([running]);
+    expect(dedupeAgents([completed, running])).toEqual([running]);
+    expect(sortAgents([second, first])).toEqual([first, second]);
+    expect(sortAgents([first, second])).toEqual([first, second]);
+  });
+
+  test("ambiguous non-RFC3339 timestamps cannot win dedupe ordering", () => {
+    const ambiguous = normalizedAgent({
+      id: `todos:${uuid(1)}`,
+      run_id: uuid(1),
+      status: "completed",
+      active: false,
+      started_at: "01/02/2026",
+      updated_at: "01/02/2026",
+      freshness_at: "01/02/2026"
+    });
+    const untimedRunning = normalizedAgent({
+      id: `todos:${uuid(1)}`,
+      run_id: uuid(1),
+      status: "running",
+      active: true,
+      started_at: null,
+      updated_at: null,
+      freshness_at: null
+    });
+
+    expect(dedupeAgents([ambiguous, untimedRunning])).toEqual([untimedRunning]);
+    expect(dedupeAgents([untimedRunning, ambiguous])).toEqual([untimedRunning]);
+
+    const future = normalizedAgent({
+      id: `todos:${uuid(1)}`,
+      run_id: uuid(1),
+      status: "completed",
+      active: false,
+      started_at: "9999-12-31T23:59:59.000Z",
+      updated_at: "9999-12-31T23:59:59.000Z",
+      freshness_at: "9999-12-31T23:59:59.000Z"
+    });
+    expect(dedupeAgents([future, untimedRunning])).toEqual([untimedRunning]);
+    expect(dedupeAgents([untimedRunning, future])).toEqual([untimedRunning]);
+  });
+
+  test("kills a detached grandchild before resolving the timeout", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tai-agents-detached-grandchild-"));
+    const pidFile = join(root, "grandchild.pid");
+    const script = [
+      'const { spawn } = require("node:child_process");',
+      'const { writeFileSync } = require("node:fs");',
+      `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      "child.unref();",
+      "setInterval(() => {}, 1000);"
+    ].join("");
+    let escapedPid: number | null = null;
+
+    try {
+      const result = await runBoundedProviderProcess({
+        command: process.execPath,
+        args: ["-e", script],
+        timeoutMs: 200
+      });
+      escapedPid = Number(readFileSync(pidFile, "utf8"));
+
+      expect(result.failure).toBe("timeout");
+      expect(isProcessLive(Number(escapedPid))).toBe(false);
+    } finally {
+      if (escapedPid && Number.isSafeInteger(escapedPid)) {
+        try {
+          process.kill(escapedPid, "SIGKILL");
+        } catch {
+          // The repaired implementation already terminated it.
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("kills a detached grandchild even after the direct child exits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tai-agents-reparented-grandchild-"));
+    const pidFile = join(root, "grandchild.pid");
+    const script = [
+      'const { spawn } = require("node:child_process");',
+      'const { writeFileSync } = require("node:fs");',
+      `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      "child.unref();"
+    ].join("");
+    let escapedPid: number | null = null;
+
+    try {
+      const result = await runBoundedProviderProcess({
+        command: process.execPath,
+        args: ["-e", script],
+        timeoutMs: 1_000
+      });
+      escapedPid = Number(readFileSync(pidFile, "utf8"));
+
+      expect(result.exitCode).toBe(0);
+      expect(result.failure).toBeUndefined();
+      expect(isProcessLive(Number(escapedPid))).toBe(false);
+    } finally {
+      if (escapedPid && Number.isSafeInteger(escapedPid)) {
+        try {
+          process.kill(escapedPid, "SIGKILL");
+        } catch {
+          // The repaired implementation already terminated it.
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("side-effect-free provider selection", () => {
   test("does not invoke mutating installed CLIs when no safe source is configured", async () => {
@@ -250,17 +540,13 @@ describe("strict safe-output normalization", () => {
     }
 
     const envelope = JSON.parse(json.stdout);
-    const agent = envelope.agents[0];
-    expect(agent.task.title).toBeNull();
-    expect(agent.worktree).toBeNull();
-    expect(agent.branch).toBeNull();
-    expect(agent.profile.alias).toBeNull();
-    expect(agent.gaps).toEqual(
-      expect.arrayContaining(["task.title", "worktree", "branch", "profile.alias"])
-    );
+    expect(http.calls).toHaveLength(0);
+    expect(envelope.agents).toEqual([]);
+    expect(envelope.sources[0].status).toBe("unavailable");
+    expect(envelope.sources[0].coverage.complete).toBe(false);
   });
 
-  test("allows only an explicit safe configured profile alias form", async () => {
+  test("does not project profile aliases from an unsupported provider", async () => {
     const safe = fakeHttp(exactResult(task(1, { profile_alias: "account001" })));
     const unsafe = fakeHttp(exactResult(task(1, { profile_alias: "account-id-123" })));
 
@@ -277,8 +563,11 @@ describe("strict safe-output normalization", () => {
     const safeEnvelope = JSON.parse(safeResponse.stdout);
     const unsafeEnvelope = JSON.parse(unsafeResponse.stdout);
 
-    expect(safeEnvelope.agents[0]?.profile.alias).toBe("account001");
-    expect(unsafeEnvelope.agents[0]?.profile.alias).toBeNull();
+    expect(safe.calls).toHaveLength(0);
+    expect(unsafe.calls).toHaveLength(0);
+    expect(safeEnvelope.agents).toEqual([]);
+    expect(unsafeEnvelope.agents).toEqual([]);
+    expect(JSON.stringify(safeEnvelope)).not.toContain("account001");
     expect(JSON.stringify(unsafeEnvelope)).not.toContain("account-id-123");
   });
 
@@ -300,7 +589,10 @@ describe("strict safe-output normalization", () => {
     expect(response.exitCode).toBe(5);
     expect(envelope.agents).toHaveLength(0);
     expect(JSON.stringify(envelope)).not.toContain(secretLikeId);
-    expect(envelope.sources[0].error.code).toBe("provider-identity-mismatch");
+    expect(http.calls).toHaveLength(0);
+    expect(envelope.sources[0].error.code).toBe(
+      "side-effect-free-surface-unavailable"
+    );
   });
 
   test("never projects raw HTTP failure bodies as diagnostics", async () => {
@@ -309,16 +601,20 @@ describe("strict safe-output normalization", () => {
       password: "secret-value",
       account_id: uuid(99)
     });
+    const http = fakeHttp({ status: 500, body: raw });
     const response = await runAgentsCli(["show", `todos:${uuid(1)}`, "--json"], {
       env: TODOS_ENV,
-      httpRunner: fakeHttp({ status: 500, body: raw }).runner,
+      httpRunner: http.runner,
       now: fixedNow
     });
 
+    expect(http.calls).toHaveLength(0);
     expect(response.exitCode).toBe(5);
     expect(response.stdout).not.toContain("secret-value");
     expect(response.stdout).not.toContain(uuid(99));
-    expect(JSON.parse(response.stdout).sources[0].error.code).toBe("provider-http-error");
+    expect(JSON.parse(response.stdout).sources[0].error.code).toBe(
+      "side-effect-free-surface-unavailable"
+    );
   });
 
   test("human formatting revalidates normalized fields instead of trusting callers", () => {
@@ -364,48 +660,43 @@ describe("strict safe-output normalization", () => {
 });
 
 describe("truthful state and completeness", () => {
-  test("missing or unsupported status and invalid future timestamps fail closed", async () => {
-    for (const hostileTask of [
-      task(1, {
-        status: undefined,
-        started_at: "9999-12-31T23:59:59.000Z",
-        updated_at: "9999-12-31T23:59:59.000Z"
-      }),
-      task(2, {
-        status: "mystery\u202e",
-        started_at: "not-a-date",
-        updated_at: "not-a-date"
-      }),
-      task(3, {
+  test("missing or unsupported status and invalid timestamps render fail-closed", () => {
+    for (const hostile of [
+      normalizedAgent({
         status: "unknown",
-        started_at: "2026-07-23T12:00:01.000Z",
-        updated_at: "2026-07-23T12:00:01.000Z"
+        active: true,
+        started_at: null,
+        updated_at: null,
+        freshness_at: null,
+        gaps: ["status", "started_at", "updated_at", "freshness_at"]
+      }),
+      normalizedAgent({
+        status: "mystery\u202e",
+        active: true,
+        started_at: "not-a-date",
+        updated_at: "not-a-date",
+        freshness_at: "9999-12-31T23:59:59.000Z",
+        gaps: ["status", "started_at", "updated_at", "freshness_at"]
       })
     ]) {
-      const response = await runAgentsCli(
-        ["show", `todos:${String(hostileTask.id)}`, "--json"],
-        {
-          env: TODOS_ENV,
-          httpRunner: fakeHttp(exactResult(hostileTask)).runner,
-          now: fixedNow
-        }
-      );
-      const envelope = JSON.parse(response.stdout);
-      const agent = envelope.agents[0];
-      expect(agent.status).toBe("unknown");
-      expect(agent.active).toBe(false);
-      expect(agent.started_at).toBeNull();
-      expect(agent.updated_at).toBeNull();
-      expect(agent.freshness_at).toBeNull();
-      expect(agent.gaps).toEqual(
+      const output = formatAgentsTable({
+        schema_version: 1,
+        generated_at: REQUEST_AT.toISOString(),
+        partial: true,
+        sources: [],
+        agents: [hostile]
+      });
+
+      expect(output).toContain("inactive:unknown");
+      expect(output).not.toContain("mystery");
+      expect(output).not.toContain("9999");
+      expect(hostile.gaps).toEqual(
         expect.arrayContaining(["status", "started_at", "updated_at", "freshness_at"])
       );
-      expect(response.stdout).not.toContain("mystery");
-      expect(response.stdout).not.toContain("9999");
     }
   });
 
-  test("every unavailable normalized field has one stable named gap", async () => {
+  test("unsupported exact source reports stable incomplete coverage without records", async () => {
     const http = fakeHttp(
       exactResult(
         task(1, {
@@ -422,64 +713,58 @@ describe("truthful state and completeness", () => {
       now: fixedNow
     });
     const envelope = JSON.parse(response.stdout);
-    const agent = envelope.agents[0];
 
-    expect(agent?.gaps).toEqual([
-      "branch",
-      "freshness_at",
-      "goal.id",
-      "goal.status",
-      "goal.title",
-      "last_tool_call.at",
-      "last_tool_call.name",
-      "last_tool_call.summary",
-      "profile.alias",
-      "started_at",
-      "task.short_id",
-      "task.title",
-      "updated_at",
-      "worktree"
-    ]);
+    expect(http.calls).toHaveLength(0);
+    expect(envelope.agents).toEqual([]);
+    expect(envelope.sources[0].status).toBe("unavailable");
+    expect(envelope.sources[0].coverage).toEqual({
+      complete: false,
+      provider_records: null,
+      projected_records: 0,
+      dropped_records: null
+    });
+    expect(envelope.sources[0].error.code).toBe(
+      "side-effect-free-surface-unavailable"
+    );
   });
 
-  test("does not project unassigned or merely assigned Todos tasks as agents", async () => {
+  test("does not project any Todos task without a safe authoritative surface", async () => {
     const cases = [
-      { value: task(1, { agent_id: undefined }), exitCode: 5 },
+      { value: task(1, { agent_id: undefined }) },
       {
-        value: task(2, { agent_id: undefined, assigned_to: "account001" }),
-        exitCode: 5
+        value: task(2, { agent_id: undefined, assigned_to: "account001" })
       },
       {
-        value: task(3, { session_id: uuid(103), agent_id: undefined }),
-        exitCode: 0
+        value: task(3, { session_id: uuid(103), agent_id: undefined })
       },
       {
         value: task(4, {
           agent_id: undefined,
           locked_by: "lease-owner",
           lock_expires_at: "2026-07-23T12:10:00.000Z"
-        }),
-        exitCode: 0
+        })
       },
       {
         value: task(5, {
           agent_id: undefined,
           locked_by: "expired-owner",
           lock_expires_at: "2026-07-23T11:59:00.000Z"
-        }),
-        exitCode: 5
+        })
       }
     ];
     for (const item of cases) {
+      const http = fakeHttp(exactResult(item.value));
       const response = await runAgentsCli(
         ["show", `todos:${String(item.value.id)}`, "--json"],
         {
           env: TODOS_ENV,
-          httpRunner: fakeHttp(exactResult(item.value)).runner,
+          httpRunner: http.runner,
           now: fixedNow
         }
       );
-      expect(response.exitCode).toBe(item.exitCode);
+      expect(response.exitCode).toBe(5);
+      expect(http.calls).toHaveLength(0);
+      expect(JSON.parse(response.stdout).agents).toEqual([]);
     }
   });
 
@@ -553,7 +838,7 @@ describe("truthful state and completeness", () => {
     expect(http.calls).toHaveLength(0);
   });
 
-  test("source freshness is the actual completion observation, not request start", async () => {
+  test("unobserved source freshness remains null instead of using request start", async () => {
     const response = await runAgentsCli(["show", `todos:${uuid(1)}`, "--json"], {
       env: TODOS_ENV,
       httpRunner: fakeHttp(exactResult(task(1))).runner,
@@ -563,12 +848,13 @@ describe("truthful state and completeness", () => {
     const source = envelope.sources[0];
 
     expect(envelope.generated_at).toBe(REQUEST_AT.toISOString());
-    expect(source?.freshness_at).toBe(OBSERVED_AT.toISOString());
+    expect(source?.freshness_at).toBeNull();
+    expect(source?.coverage.complete).toBe(false);
   });
 });
 
 describe("exact lookup and CLI semantics", () => {
-  test("exact show queries only the selected provider with one targeted GET", async () => {
+  test("exact show queries only the selected provider and performs no unsafe operation", async () => {
     const target = task(201);
     const http = fakeHttp((request) => {
       expect(new URL(request.url).pathname).toBe(`/v1/tasks/${uuid(201)}`);
@@ -582,11 +868,12 @@ describe("exact lookup and CLI semantics", () => {
     });
     const envelope = JSON.parse(response.stdout);
 
-    expect(response.exitCode).toBe(0);
-    expect(http.calls).toHaveLength(1);
+    expect(response.exitCode).toBe(5);
+    expect(http.calls).toHaveLength(0);
     expect(envelope.sources).toHaveLength(1);
     expect(envelope.sources[0].provider).toBe("todos");
-    expect(envelope.agents[0].id).toBe(`todos:${uuid(201)}`);
+    expect(envelope.sources[0].status).toBe("unavailable");
+    expect(envelope.agents).toEqual([]);
   });
 
   test("selected-source unavailability is incomplete, never false not-found", async () => {
@@ -605,17 +892,19 @@ describe("exact lookup and CLI semantics", () => {
     expect(http.calls).toHaveLength(0);
   });
 
-  test("only an exact complete 404 becomes agent-not-found", async () => {
+  test("arbitrary HTTP 404 cannot become authoritative agent-not-found", async () => {
+    const http = fakeHttp({ status: 404, body: '{"error":"not found"}' });
     const response = await runAgentsCli(["show", `todos:${uuid(1)}`, "--json"], {
       env: TODOS_ENV,
-      httpRunner: fakeHttp({ status: 404, body: '{"error":"not found"}' }).runner,
+      httpRunner: http.runner,
       now: fixedNow
     });
     const envelope = JSON.parse(response.stdout);
 
-    expect(response.exitCode).toBe(4);
-    expect(envelope.error.code).toBe("agent-not-found");
-    expect(envelope.sources[0].coverage.complete).toBe(true);
+    expect(response.exitCode).toBe(5);
+    expect(http.calls).toHaveLength(0);
+    expect(envelope.error.code).toBe("agent-lookup-incomplete");
+    expect(envelope.sources[0].coverage.complete).toBe(false);
   });
 
   test("an exact task without agent provenance is incomplete, not absent", async () => {
@@ -629,7 +918,9 @@ describe("exact lookup and CLI semantics", () => {
 
     expect(response.exitCode).toBe(5);
     expect(envelope.error.code).toBe("agent-lookup-incomplete");
-    expect(envelope.sources[0].error.code).toBe("agent-provenance-missing");
+    expect(envelope.sources[0].error.code).toBe(
+      "side-effect-free-surface-unavailable"
+    );
   });
 
   test("show rejects --limit and malformed or secret-like IDs before provider execution", async () => {
@@ -657,7 +948,7 @@ describe("exact lookup and CLI semantics", () => {
     });
     const envelope = JSON.parse(json.stdout);
 
-    expect(json.exitCode).toBe(0);
+    expect(json.exitCode).toBe(5);
     expect(envelope.schema_version).toBe(AGENTS_SCHEMA_VERSION);
     expect(Object.keys(envelope.sources[0]).sort()).toEqual([
       "coverage",
@@ -672,23 +963,7 @@ describe("exact lookup and CLI semantics", () => {
       "projected_records",
       "provider_records"
     ]);
-    expect(Object.keys(envelope.agents[0]).sort()).toEqual([
-      "active",
-      "branch",
-      "freshness_at",
-      "gaps",
-      "goal",
-      "id",
-      "last_tool_call",
-      "profile",
-      "provider",
-      "run_id",
-      "started_at",
-      "status",
-      "task",
-      "updated_at",
-      "worktree"
-    ]);
+    expect(envelope.agents).toEqual([]);
     expect(formatAgentsTable(envelope)).toContain("WARNING incomplete sources:");
   });
 
