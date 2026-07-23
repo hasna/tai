@@ -41,6 +41,12 @@ Routing is local-first:
 
 Model IDs are intentionally configuration-driven because availability is time-sensitive.
 
+## Agent Visibility Facade
+
+The `tai agents` surface is separate from model routing. It is a stateless, read-only facade over the installed Codewith background-agent list, Claude agent list, and Todos active-task command surfaces. A request makes one bounded, non-shell provider call per source and projects the returned batch locally; it never performs a provider read for each result.
+
+The normalized schema records only bounded status/context fields exposed by those list surfaces. Missing worktree, branch, tool, goal, task, profile, timestamp, or freshness data stays `null` and is named in `gaps`. Source failures are isolated and diagnosed with stable codes. TAI owns no database, daemon, cache, task assignment, authorization, or agent lifecycle state, and this surface contains no stop, retry, resume, profile-switch, notification, fleet, web, or TUI behavior.
+
 ## Safety Policy
 
 Read-only commands may run without confirmation. Writes, network calls, package manager operations, process control, and mutable git operations require confirmation. Destructive operations, credential disclosure, privilege escalation, deploy/publish, and force-push operations are blocked unless the user uses an explicit override.

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createTai } from "../sdk";
 import { formatAgenticPlan } from "../agentic-plan";
+import { runAgentsCli } from "../agents";
 import { formatCommandPreview } from "../proposal";
 import { classifyCommand } from "../safety";
 import { runShellCommand } from "../shell";
@@ -31,6 +32,17 @@ async function main(): Promise<number> {
     const plan = await createTai().plan(request);
     console.log(formatAgenticPlan(plan));
     return plan.blocked ? 2 : 0;
+  }
+
+  if (command === "agents") {
+    const result = await runAgentsCli(args);
+    if (result.stdout) {
+      console.log(result.stdout);
+    }
+    if (result.stderr) {
+      console.error(result.stderr);
+    }
+    return result.exitCode;
   }
 
   if (command === "run") {
@@ -65,6 +77,8 @@ function printHelp(): void {
 Usage:
   tai propose <request>
   tai plan <request>
+  tai agents [--json] [--limit <1-200>]
+  tai agents show <provider>:<run-id> [--json]
   tai classify <command>
   tai run <command> [--yes] [--override]
 `);

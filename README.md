@@ -25,11 +25,30 @@ The package installs the local data directory at `~/.hasna/tai/`.
 ```bash
 tai propose "show the largest files in this repo"
 tai plan "inspect the repo status, run the relevant checks, and show me the safe next commands"
+tai agents
+tai agents --json
+tai agents show codewith:<run-id>
 tai classify "rm -rf dist"
 tai run "ls -la" --yes
 ```
 
 `tai run` streams stdout/stderr directly and exits with the child command status. It preserves the current working directory and environment by default, and forwards common process signals to the child.
+
+### Headless agent visibility
+
+`tai agents [--limit <1-200>]` is a local, stateless, read-only projection of the installed Codewith, Claude, and Todos agent surfaces. The default limit is 50. `tai agents show <provider>:<run-id>` selects one exact normalized record. Add `--json` to either form for the versioned machine contract.
+
+Each source is invoked at most once per command. Missing providers fail soft: available records are still returned with `partial: true` and bounded source diagnostics. If every provider fails, the command exits nonzero. The command does not persist data, inspect transcripts or prompts, call a provider once per record, switch profiles, or own agent lifecycle state.
+
+JSON v1 has these stable fields:
+
+- Envelope: `schema_version` (number, currently `1`), `generated_at` (ISO-8601 string), `partial` (boolean), `sources` (source diagnostics), and `agents` (normalized records). Command errors add a bounded `error` object.
+- Source diagnostic: `provider` (`codewith|claude|todos`), `status` (`ok|partial|unavailable|error`), `freshness_at` (ISO-8601 string or `null`), and optional `error: {code, message}`.
+- Agent identity/state: `id`, `provider`, `run_id`, `status`, `active`, `started_at`, `updated_at`, `freshness_at`.
+- Agent context: `worktree`, `branch`, `last_tool_call: {name, at, summary}`, `goal: {id, title, status}`, `task: {id, short_id, title, status}`, and `profile: {alias}`.
+- `gaps` is an array of explicit missing or stale normalized fields. Unavailable provider fields remain `null`; they are never inferred from prompt, transcript, or matching text.
+
+Text fields and diagnostics are bounded and redacted. Profile output accepts only a safe configured alias such as `account001`; it never includes email, account ID, auth path, token, or credential metadata. Provider command output is captured under a hard byte and time limit, and raw transcripts, full prompts, full tool arguments, and environment dumps are not projected.
 
 ## Provider Routing
 
