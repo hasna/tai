@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { createTai } from "../sdk";
 import { classifyCommand } from "../safety";
 import { redactSensitiveText } from "../redaction";
+import { readPackageVersion } from "../version";
 
 type JsonRpcRequest = {
   id?: string | number;
@@ -77,7 +78,7 @@ async function handle(request: JsonRpcRequest): Promise<unknown> {
   if (request.method === "initialize") {
     return {
       protocolVersion: "2024-11-05",
-      serverInfo: { name: "tai-mcp", version: "0.1.0" },
+      serverInfo: { name: "tai-mcp", version: readPackageVersion() },
       capabilities: { tools: {} }
     };
   }

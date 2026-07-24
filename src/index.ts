@@ -8,6 +8,7 @@ export { parseCommandProposal, formatCommandPreview } from "./proposal";
 export { ProviderRouter, createDefaultProviders } from "./providers/router";
 export { OpenAICompatibleProvider } from "./providers/openai-compatible";
 export { runShellCommand } from "./shell";
+export { readPackageVersion } from "./version";
 export type {
   CommandClassification,
   AgenticCommandPlan,
