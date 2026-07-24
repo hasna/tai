@@ -16,6 +16,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "SECURITY.md",
     "CONTRIBUTING.md"
@@ -35,8 +36,10 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "dev:cli": "bun run src/cli/index.ts",
-    "dev:mcp": "bun run src/mcp/index.ts",
-    "postinstall": "bun run scripts/postinstall.ts"
+    "dev:mcp": "bun run src/mcp/index.ts"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/bun": "^1.2.18",

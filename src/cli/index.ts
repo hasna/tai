@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readPackageVersion } from "../version";
 import { createTai } from "../sdk";
 import { formatAgenticPlan } from "../agentic-plan";
 import { formatCommandPreview } from "../proposal";
@@ -10,6 +11,11 @@ const [, , command, ...args] = process.argv;
 async function main(): Promise<number> {
   if (!command || command === "--help" || command === "-h") {
     printHelp();
+    return 0;
+  }
+
+  if (command === "--version" || command === "-v" || command === "version") {
+    console.log(readPackageVersion());
     return 0;
   }
 
@@ -60,13 +66,14 @@ async function main(): Promise<number> {
 }
 
 function printHelp(): void {
-  console.log(`tai
+  console.log(`tai ${ readPackageVersion() }
 
 Usage:
   tai propose <request>
   tai plan <request>
   tai classify <command>
   tai run <command> [--yes] [--override]
+  tai --version
 `);
 }
 
