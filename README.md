@@ -7,11 +7,15 @@ It does not expose hidden reasoning or chain-of-thought. Provider outputs are pa
 ## Install
 
 ```bash
+bun add -g @hasna/tai
+```
+
+From a source checkout:
+
+```bash
 bun install
 bun run build
 ```
-
-The package installs the local data directory at `~/.hasna/tai/`.
 
 ## Surfaces
 
@@ -102,4 +106,4 @@ bun test
 
 ## GitHub Status
 
-Canonical public repository: https://github.com/hasna/tai. Publishing `@hasna/tai` or creating a GitHub release requires explicit maintainer approval.
+Canonical public repository: https://github.com/hasna/tai. `@hasna/tai` is published to npm; releases are cut by maintainers.

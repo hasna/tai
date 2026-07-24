@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createRequire } from "node:module";
 import { createTai } from "../sdk";
 import { formatAgenticPlan } from "../agentic-plan";
 import { formatCommandPreview } from "../proposal";
@@ -10,6 +11,11 @@ const [, , command, ...args] = process.argv;
 async function main(): Promise<number> {
   if (!command || command === "--help" || command === "-h") {
     printHelp();
+    return 0;
+  }
+
+  if (command === "--version" || command === "-v" || command === "version") {
+    console.log(readPackageVersion());
     return 0;
   }
 
@@ -59,14 +65,27 @@ async function main(): Promise<number> {
   return 2;
 }
 
+function readPackageVersion(): string {
+  // Resolved from the shipped package.json so the version is never duplicated in source.
+  // Works both from src/cli/index.ts and from the bundled dist/cli/index.js.
+  try {
+    const require = createRequire(import.meta.url);
+    const manifest = require("../../package.json") as { version?: string };
+    return manifest.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 function printHelp(): void {
-  console.log(`tai
+  console.log(`tai ${ readPackageVersion() }
 
 Usage:
   tai propose <request>
   tai plan <request>
   tai classify <command>
   tai run <command> [--yes] [--override]
+  tai --version
 `);
 }
 
