@@ -5,5 +5,7 @@ Report vulnerabilities privately to the Hasna maintainers. Do not file public is
 Credential redaction of displayed, logged and MCP-returned text is documented in
 [`docs/redaction.md`](docs/redaction.md), including the shapes that are **not**
 covered. Read the residual list there before assuming a given shape is masked.
+That list is explicitly **not** exhaustive — a shape's absence from it is not
+evidence that the shape is safe.
 
 `tai` is designed to preview commands and classify risk before execution. Treat command classification as defense in depth, not as a sandbox. Users remain responsible for confirming commands before they run.
