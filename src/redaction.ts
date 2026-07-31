@@ -9,7 +9,32 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   // Basic auth that payload IS the credential, so the output read
   // `Authorization: [REDACTED] <base64>`: a secret wearing a marker that says
   // it was handled.
-  [/(\bauthorization['"]?\s*:\s*)(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s'"]+/gi, "$1[REDACTED]"],
+  //
+  // Three things had to widen together, because fixing any one of them alone
+  // leaves the identical `[REDACTED] <credential>` output one character away:
+  //
+  //  * `[:=]` — a header line uses `:`, an env dump or a query string uses `=`.
+  //  * No `\b` before `authorization`. `_` IS a word character, so `\b` never
+  //    matched inside `HTTP_AUTHORIZATION` or `proxy_authorization`. Dropping
+  //    the anchor lets the match start at `authorization` and leaves the prefix
+  //    outside the match, which produces the same output without it.
+  //  * A trailing `[A-Za-z0-9_-]*` so that `authorization_header:` reaches its
+  //    separator instead of stopping at the key.
+  //
+  // The prefix is deliberately NOT matched with a leading `[A-Za-z0-9_-]*`: a
+  // star before the literal makes the scan quadratic on long inputs, and the
+  // sibling redactor in iapp-sms already has a measured 8.4s/50k quadratic that
+  // this must not reproduce here.
+  [/(authorization[A-Za-z0-9_-]*['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
+  // AWS SigV4 puts the signature in a trailing `Signature=` segment of the same
+  // Authorization header. The rule above eats the scheme and the first
+  // comma-delimited part, so without this the header came out as
+  // `Authorization: [REDACTED] ... Signature=<live signature>` — a marker at the
+  // front of a line whose end is still a credential, which is the same
+  // misleading shape this file exists to remove rather than a mere gap.
+  // The value class stops at `&`, `,` and `;` so that redacting a signature in a
+  // query string does not swallow the unrelated parameters after it.
+  [/(signature[A-Za-z0-9_-]*['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"&,;]+)/gi, "$1$2[REDACTED]$2"],
   [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   [/((?:api|access|secret|token|password|passwd|pwd)[_-]?key?\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*['"]?\s*:\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
