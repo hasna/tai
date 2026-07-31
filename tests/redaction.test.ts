@@ -45,7 +45,32 @@ test("removes the credentials segment of an Authorization header", () => {
     `authorization: basic ${BASIC_CREDENTIALS}`,
     `AUTHORIZATION: BASIC ${BASIC_CREDENTIALS}`,
     // Both the header-line and the object-literal spellings reach logs.
-    `{"Authorization": "Basic ${BASIC_CREDENTIALS}"}`
+    `{"Authorization": "Basic ${BASIC_CREDENTIALS}"}`,
+    // `=` rather than `:` — an env dump or a query string, not a header line.
+    // Every one of these produced `[REDACTED] <credential>` until the separator
+    // class was widened: marker shown, credential intact.
+    `authorization=Basic ${BASIC_CREDENTIALS}`,
+    `AUTHORIZATION=Basic ${BASIC_CREDENTIALS}`,
+    `authorization = Basic ${BASIC_CREDENTIALS}`,
+    `authorization=Digest ${BEARER_CREDENTIALS}`,
+    `Authorization=Bearer ${BEARER_CREDENTIALS}`,
+    // `_` is a word character, so the `\b` this rule used to carry could never
+    // match inside any of these. That one fact accounts for the whole family.
+    `HTTP_AUTHORIZATION=Basic ${BASIC_CREDENTIALS}`,
+    `AUTHORIZATION_HEADER=Basic ${BASIC_CREDENTIALS}`,
+    `authorization_header: Basic ${BASIC_CREDENTIALS}`,
+    `proxy_authorization=Basic ${BASIC_CREDENTIALS}`,
+    // The hyphen and underscore spellings are NOT the same case: `\b` does match
+    // after a hyphen, so `Proxy-Authorization:` was already clean while
+    // `proxy-authorization=` was not. Both are pinned so neither regresses alone.
+    `proxy-authorization=Basic ${BASIC_CREDENTIALS}`,
+    `Proxy-Authorization: Basic ${BASIC_CREDENTIALS}`,
+    // Not at the start of the line — a log line wraps the header in context.
+    `req headers AUTHORIZATION=Basic ${BASIC_CREDENTIALS} done`,
+    // Serialized JSON reaches logs whenever a request is logged as a string
+    // rather than as an object.
+    `{"headers":{"authorization":"Basic ${BASIC_CREDENTIALS}"}}`,
+    `{"headers":{"HTTP_AUTHORIZATION":"Basic ${BASIC_CREDENTIALS}"}}`
   ] as const;
 
   for (const input of cases) {
@@ -59,19 +84,60 @@ test("removes the credentials segment of an Authorization header", () => {
   }
 });
 
+// AWS SigV4 carries the signature in a trailing `Signature=` segment. The
+// Authorization rule eats the scheme and the first comma-delimited part, so
+// before this was covered the header printed a marker at the front of a line
+// whose end was still a live signature.
+const SIGV4_SIGNATURE = "0000deadbeefsyntheticsignature1111notreal2222abcdef3333abcdef4444";
+
+test("removes an AWS SigV4 signature wherever it appears", () => {
+  const cases = [
+    `Signature=${SIGV4_SIGNATURE}`,
+    // The credential-id segment is deliberately NOT written in AWS's `AKIA…`
+    // shape: the staged-secrets gate matches that prefix on sight, and a fixture
+    // that trips the gate teaches people to wave the gate through. The assertion
+    // here is about the TRAILING `Signature=` segment, which needs no key id.
+    `Authorization: AWS4-HMAC-SHA256 Credential=SYNTHETIC-KEY-ID/20260731/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=${SIGV4_SIGNATURE}`,
+    `https://example.com/object?X-Amz-Signature=${SIGV4_SIGNATURE}&x=1`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(SIGV4_SIGNATURE);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+
+  // Redacting a signature inside a query string must not swallow the unrelated
+  // parameters that follow it — over-consuming would be its own defect.
+  expect(redactSensitiveText(`https://example.com/object?X-Amz-Signature=${SIGV4_SIGNATURE}&x=1`)).toContain("&x=1");
+});
+
 test("positive control: the absence assertion can fail", () => {
   // If `not.toContain(BASIC_CREDENTIALS)` passed no matter what was fed in, the
   // test above would prove nothing. This anchors it: the identical literal, in
   // free prose that carries no credential context, is left alone and IS found.
   const prose = `The build log mentioned ${BASIC_CREDENTIALS} in passing.`;
   expect(redactSensitiveText(prose)).toContain(BASIC_CREDENTIALS);
+  // Same anchor for the SigV4 literal, so that test cannot pass vacuously either.
+  const sigProse = `The build log mentioned ${SIGV4_SIGNATURE} in passing.`;
+  expect(redactSensitiveText(sigProse)).toContain(SIGV4_SIGNATURE);
 });
 
 test("does not over-redact text that carries no credential", () => {
   const safe = [
     "Authorization is handled by the gateway.",
     "GET /v1/models 200 in 42ms",
-    'export APP_MODE="development"'
+    'export APP_MODE="development"',
+    // Widening the separator to `[:=]` must not let the rule reach across an
+    // unrelated assignment. Without these the over-redaction test only feeds in
+    // strings nothing would ever have matched, and so guards nothing.
+    "mode=production",
+    "retries=3 timeout=30",
+    "status=ok count=42 duration=1.5s",
+    // Dropping the `\b` widened what counts as a key; prose that merely contains
+    // the words must still come back byte-identical.
+    "signature verified for block 1234",
+    "SignedHeaders=host;x-amz-date"
   ] as const;
 
   for (const input of safe) {
