@@ -25,7 +25,28 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   // star before the literal makes the scan quadratic on long inputs, and the
   // sibling redactor in iapp-sms already has a measured 8.4s/50k quadratic that
   // this must not reproduce here.
-  [/(authorization[A-Za-z0-9_-]*['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
+  // Two further details, both found by adversarial review of the first attempt
+  // at this rule and both measured:
+  //
+  //  * The closing quote is OPTIONAL (`\2?`). A log line truncated at a byte
+  //    limit — syslog's 1024, journald, CloudWatch — arrives as
+  //    `{"headers":{"authorization":"Basic <cred>` with no closing quote. When
+  //    the quoted alternative required its backreference the rule declined, and
+  //    a weaker downstream rule then printed the marker followed by the
+  //    credential. Truncation is the normal state of a long log line, not an
+  //    edge case.
+  //  * The optional scheme token is NOT consumed when the token after it is
+  //    itself a `key=value` pair. `authorization=denied user=bob reason=scope`
+  //    otherwise had `user=bob` swallowed and DELETED — over-redaction that
+  //    destroys an adjacent field rather than masking it. The lookahead tests
+  //    for `=` followed by a non-`=`, which a real `key=value` has and base64
+  //    padding (`…RA==`) does not.
+  //
+  // The trailing key run is BOUNDED at 32. Unbounded, it rescans the rest of the
+  // input from every position the literal matches, which is quadratic on a line
+  // full of repeated `HTTP_AUTHORIZATION_` tokens. A real key suffix is `_header`
+  // or similar, so 32 costs nothing and keeps the scan linear.
+  [/(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|(?:[A-Za-z][A-Za-z0-9._-]*\s+(?![^\s'"]*=[^\s'"=]))?[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   // AWS SigV4 puts the signature in a trailing `Signature=` segment of the same
   // Authorization header. The rule above eats the scheme and the first
   // comma-delimited part, so without this the header came out as
@@ -34,7 +55,7 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   // misleading shape this file exists to remove rather than a mere gap.
   // The value class stops at `&`, `,` and `;` so that redacting a signature in a
   // query string does not swallow the unrelated parameters after it.
-  [/(signature[A-Za-z0-9_-]*['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"&,;]+)/gi, "$1$2[REDACTED]$2"],
+  [/(signature[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|[^\s'"&,;]+)/gi, "$1$2[REDACTED]$2"],
   [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   [/((?:api|access|secret|token|password|passwd|pwd)[_-]?key?\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*['"]?\s*:\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
