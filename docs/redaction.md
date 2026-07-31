@@ -41,6 +41,8 @@ Measured by execution against `src/redaction.ts` at `127ffc4` on 2026-07-31
 | `{"Authorization": "Basic <b64>"}` and nested serialized JSON | redacted |
 | quoted, single-quoted and `export`-prefixed spellings | redacted |
 | AWS SigV4 trailing `Signature=`, bare / in-header / in a query string | redacted |
+| a line **truncated mid-value** by a byte limit, so the closing quote is missing | redacted |
+| the value masked **without deleting the fields beside it** (`authorization=denied user=bob` keeps `user=bob`) | preserved |
 | `sk-`, `gsk_`, `csk-`, `AKIA…` provider keys | redacted |
 | `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, `*AUTH*` assignments | redacted |
 
@@ -51,14 +53,19 @@ Two details are load-bearing and easy to undo by accident:
    `proxy_authorization`. That single fact accounted for an entire family of
    leaks. The match simply starts at `authorization` and leaves any prefix
    outside the match, which produces identical output.
-2. **The key is not prefixed with `[A-Za-z0-9_-]*`.** A star before the literal
-   makes the scan quadratic on long inputs.
+2. **The key run is bounded on both sides.** There is no `[A-Za-z0-9_-]*` before
+   the literal, and the run *after* it is capped at 32. An unbounded run on
+   either side rescans the remaining input from every position the literal
+   matches, which is quadratic. A real key suffix is `_header` or similar, so the
+   cap costs nothing.
+3. **The closing quote is optional and the scheme is not consumed across a
+   `key=value`.** Both were found by adversarial review of the first version of
+   this rule; see the covered table above. Neither is cosmetic — the first left a
+   credential in every truncated log line, the second deleted adjacent fields.
 
-   **Two corrections to what this note used to say, both measured on
-   station02 with the regexes read from source rather than retyped.**
-
-   *The sibling's quadratic is `URL_USERINFO_PATTERN`, not
-   `redactNamedAssignments`.* Earlier versions of this note cited
+   *Correction carried forward from #13 — the sibling's quadratic is
+   `URL_USERINFO_PATTERN`, not `redactNamedAssignments`.*
+Earlier versions of this note cited
    `hasnaxyz/iapp-sms` as carrying a `~8.4s/50k` quadratic in
    `redactNamedAssignments`. Per-pattern at n=50000 on a single repeated
    character: `URL_USERINFO_PATTERN` 2947ms, `NAMED_ASSIGNMENT_PATTERN`
@@ -68,15 +75,26 @@ Two details are load-bearing and easy to undo by accident:
    opens with a bare `[a-z]` and retries at every position. The `~8.4s`
    figure was station01; `~2.9s` is station02. Quote the box with the number.
 
-   *And `tai` is NOT exempt.* This note used to say `tai` "stays at
-   single-digit milliseconds on the same input". That is true **only** for
-   the single-repeated-character input (0.6ms at 50k, 2.0x per doubling),
-   and it was read as "`tai` has no quadratic", which is false. On an
-   `authorization`-dense 50k run `redactSensitiveText` is **470ms at 4.0x
-   per doubling — quadratic** (691ms on an all-lowercase `authorization`
-   run). See the residual table. **One input class cannot establish the
-   absence of a quadratic**, and generalising from one is exactly how this
-   claim became wrong.
+### Performance, measured rather than asserted
+
+An earlier version of this file claimed this redactor had "no quadratic" and ran
+in "single-digit milliseconds". **That was wrong, and it was wrong about `main`
+as much as about the change that introduced the claim.** Measured on an idle
+host, interleaved in one process, input of repeated `HTTP_AUTHORIZATION_` tokens:
+
+| | 6.25k | 12.5k | 25k | 50k | growth |
+|---|---|---|---|---|---|
+| `main` before this change | 5.1ms | 20.1ms | 80.7ms | 323.6ms | **4.0×/doubling** |
+| with this change | 5.1ms | 20.2ms | 80.5ms | 323.8ms | **4.0×/doubling** |
+
+So: **this redactor already had a quadratic path on that input, this change does
+not add to it, and this change does not remove it.** The growth ratio per
+doubling is the load-independent statistic — absolute figures move with machine
+load, ratios do not. On bare repeated characters both are linear (~0.5ms at 50k).
+
+The quadratic is pre-existing and comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*`
+key rules, not from the Authorization rule. It is listed as an open residual
+below rather than claimed absent.
 
 ## Not covered — known residuals
 
@@ -104,22 +122,21 @@ that is this file working, not this file failing.
 | `authorization%3DBasic%20<cred>` — percent-encoded | honest gap | **Live.** Nothing percent-decodes free text before matching, so no key is ever seen. |
 | quadratic blow-up in the `authorization` key rule | availability, P2 | **Live.** 470ms for a 50k `HTTP_AUTHORIZATION_` run and 691ms for a 50k lowercase `authorization` run, both at **4.0x per doubling** (station02). Cause: the **trailing** `[A-Za-z0-9_-]*` rescans the remaining run from every position the literal matches. `hasnaxyz/iapp-sms` fixed the identical shape by bounding that run at 32, which restored 2.0x per doubling there; the bound has **not** been applied here. Not addressed in this change, which is documentation only — bounding the run alters what the pattern accepts and must be re-run against the over-redaction set. |
 | a bare high-entropy value with no recognisable key or prefix | honest gap | Structural. No keyword and no prefix means nothing to key on; this cannot be closed by pattern matching. |
+| quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling, ~324ms at 50k, byte-identical before and after this change. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. |
 | Unicode or non-ASCII spellings of header names | unmeasured | Never probed. Absence of a finding here is absence of evidence, not evidence of absence. |
 | whether every runtime call site actually routes through this function | unmeasured | This file measures the function, not its callers. A correct redactor on a path nothing calls redacts nothing. |
 
-**One over-redaction destroys data rather than masking it, and is not
-intentional.** `authorization=denied user=bob reason=scope` becomes
-`authorization=[REDACTED] reason=scope` — **`user=bob` is deleted**, because the
-optional scheme group consumes `denied ` as a scheme and then eats the next
-whole token. An adjacent audit field is silently lost. Fail-safe as to leaking,
-but a log that quietly drops fields is its own defect. `hasnaxyz/iapp-sms` fixed
-this with a lookahead; that fix is not here, and its own lookahead introduced a
-separate regression, so this should be fixed deliberately rather than by copying.
+**Over-masking that is intentional, stated so it is not mistaken for a bug.**
+Any key containing `signature` has its value masked, so `signature_algorithm=RSA-SHA256`
+and `SignatureVersion=4` are masked too. Over-masking a non-secret is cheap; a
+leaked signature is not. `hasnaxyz/iapp-sms` does **not** mask `SignatureVersion`
+— its rule requires a `-`/`_` boundary — so the two repos genuinely differ here.
+Both behaviours are pinned by tests so neither drifts silently.
 
-`signature`-keyed values are redacted conservatively: any key containing
-`signature` has its value masked, so `signature_algorithm=RSA-SHA256` is masked
-too. That is intentional — over-masking a non-secret is cheap, and a signature
-reaching a log is not.
+The same applies to any key containing `authorization`: its value is masked even
+when that value is not a secret, so `authorization=denied` becomes
+`authorization=[REDACTED]`. What must **not** happen is the fields *beside* it
+being deleted, which is a separate matter and is tested.
 
 ## Divergence from `hasnaxyz/iapp-sms`
 
