@@ -16,6 +16,7 @@ test("redacts named credential values in assignments and mappings", () => {
     ["AUTH_TOKEN='abcdef123456'", "abcdef123456"],
     ["DB_PASSWORD=hunter2", "hunter2"],
     ['{"API_TOKEN": "json-secret-123"}', "json-secret-123"],
+    ['{"auth_token": "lowercase-json-token-789"}', "lowercase-json-token-789"],
     ['{"api_key": "lowercase-secret-456"}', "lowercase-secret-456"]
   ] as const;
 
