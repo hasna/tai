@@ -137,6 +137,11 @@ test("removes a Digest response that sits far into a long header", () => {
 // ~2x per doubling and quadratic stays ~4x whether the box is idle or busy.
 const GROWTH_SIZES_KIB = [16, 32, 64] as const;
 
+// Shared calibration bounds for both growth helpers.
+const RUN_GROWTH_FLOOR_MS = 1.5;
+const RUN_GROWTH_MIN_KIB = 8;
+const RUN_GROWTH_MAX_BASE_KIB = 128;
+
 // TAKE THE FASTEST SAMPLE, NOT THE MEDIAN, and warm up before sampling. This
 // suite runs on contended boxes, and CPU contention is strictly ADDITIVE noise:
 // a sample can be slowed by another process but never sped up, so the minimum is
@@ -162,9 +167,29 @@ function fastestMillis(input: string, runs = 9): number {
   return fastest;
 }
 
+function repeatedInput(unit: string, separator: string, kib: number): string {
+  return Array.from({ length: Math.floor((kib * 1024) / unit.length) }, () => unit).join(separator);
+}
+
+// Calibrated to the machine for the same reason as the run-length helper below:
+// at a fixed small size a fast, quiet runner finishes in a fraction of a
+// millisecond, timer resolution dominates the ratio, and the assertion fails
+// while the implementation is perfectly linear. This family has been the source
+// of every flake in this suite — the Digest control failed 1 run in 8 here at
+// loadavg 25, and was measured at 2 in 10 before the estimator was changed.
+// Growing until the measurement is solid removes the noise without touching the
+// threshold, which is the part that must not move.
 function growthPerDoubling(unit: string, separator: string): number {
-  const times = GROWTH_SIZES_KIB.map((kib) =>
-    fastestMillis(Array.from({ length: Math.floor((kib * 1024) / unit.length) }, () => unit).join(separator))
+  let baseKib = GROWTH_SIZES_KIB[0];
+  while (
+    baseKib < RUN_GROWTH_MAX_BASE_KIB
+    && fastestMillis(repeatedInput(unit, separator, baseKib), 3) < RUN_GROWTH_FLOOR_MS
+  ) {
+    baseKib *= 2;
+  }
+
+  const times = [baseKib, baseKib * 2, baseKib * 4].map((kib) =>
+    fastestMillis(repeatedInput(unit, separator, kib))
   );
   const ratios = times.slice(1).map((time, index) => time / times[index]);
   return ratios.reduce((total, ratio) => total + ratio, 0) / ratios.length;
@@ -474,11 +499,44 @@ test("keeps Set-Cookie attributes and neighbouring log fields readable", () => {
 // because `sid=` satisfies the literal immediately and the scan never has to
 // fail — 0.04 ms against 228 ms for the shape below. Both assertions here
 // therefore put the whole run AFTER the header separator and BEFORE any `=`.
-const RUN_GROWTH_SIZES_KIB = [8, 16, 32] as const;
+// SIZES ARE CALIBRATED TO THE MACHINE, not fixed, and that is what makes this
+// assertion honest in BOTH directions.
+//
+// Fixed at 8/16/32 KiB it failed CI at ratio well outside tolerance while the
+// implementation was perfectly linear: on a fast, quiet runner the linear scan
+// finishes those sizes in a fraction of a millisecond, and at that scale timer
+// resolution and JIT noise dominate the ratio. A test that can fail when nothing
+// is wrong is exactly as useless as one that cannot fail when something is —
+// this file already had the second kind, and replacing it with the first would
+// be no improvement.
+//
+// So: grow the smallest size until it is comfortably above timer noise, then
+// measure across three doublings from there. The two cases separate themselves
+// without a threshold change.
+//
+//  - A LINEAR implementation is fast, so calibration keeps doubling and ends up
+//    measuring at sizes where the numbers are solid. Cheap either way.
+//  - A QUADRATIC one is already far above the floor at the smallest size, so
+//    calibration stops immediately and the assertion fails at small sizes and
+//    therefore FAST — measured at ~29s against a mutant carrying the naive
+//    pattern. A test that can only fail by timing out reports its budget rather
+//    than a duration.
+
+function runLengthInput(prefix: string, kib: number): string {
+  return prefix + "x".repeat(kib * 1024 - prefix.length);
+}
 
 function runLengthGrowthPerDoubling(prefix: string): number {
-  const times = RUN_GROWTH_SIZES_KIB.map((kib) =>
-    fastestMillis(prefix + "x".repeat(kib * 1024 - prefix.length), 5)
+  let baseKib = RUN_GROWTH_MIN_KIB;
+  while (
+    baseKib < RUN_GROWTH_MAX_BASE_KIB
+    && fastestMillis(runLengthInput(prefix, baseKib), 3) < RUN_GROWTH_FLOOR_MS
+  ) {
+    baseKib *= 2;
+  }
+
+  const times = [baseKib, baseKib * 2, baseKib * 4].map((kib) =>
+    fastestMillis(runLengthInput(prefix, kib), 5)
   );
   const ratios = times.slice(1).map((time, index) => time / times[index]);
   return ratios.reduce((total, ratio) => total + ratio, 0) / ratios.length;
