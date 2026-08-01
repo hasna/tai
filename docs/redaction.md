@@ -26,12 +26,13 @@ Two classes are therefore tracked separately below:
 
 ## Covered
 
-Measured by execution against `src/redaction.ts` at `127ffc4` on 2026-07-31
-(UTC), station02. 31-shape probe, synthetic fixtures throughout — no real credential is used or rendered at any point.
+Measured by execution against `src/redaction.ts`, with synthetic fixtures
+throughout — no real credential is used or rendered at any point.
 
 | shape | result |
 |---|---|
-| `Authorization: Basic <b64>` (any scheme, any case) | redacted |
+| single-token `Authorization` values such as `Basic <b64>` or `Bearer <token>` (any scheme case) | redacted |
+| `Authorization: Digest ... response="<digest proof>"` | redacted |
 | `authorization=Basic <b64>` — `=` instead of `:` | redacted |
 | `authorization = Basic <b64>` — spaces around the separator | redacted |
 | `HTTP_AUTHORIZATION=`, `AUTHORIZATION_HEADER=`, `authorization_header:` | redacted |

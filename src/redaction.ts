@@ -3,6 +3,11 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\b(gsk_[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_GROQ_KEY]"],
   [/\b(csk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_CEREBRAS_KEY]"],
   [/\b(AKIA[0-9A-Z]{16})\b/g, "[REDACTED_AWS_KEY]"],
+  // Digest auth stores its credential proof in a quoted `response=` parameter.
+  // Mask it before the broader Authorization rule below replaces the scheme
+  // token; otherwise the line can still print a marker while the response
+  // survives beside it.
+  [/(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*Digest\s+[^\r\n]*?\bresponse\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|[^\s'",]+)/gi, "$1$2[REDACTED]$2"],
   // Consume the scheme AND the credentials that follow it. Matching only
   // `Bearer` left `Authorization: Basic <base64>` to the generic key:value rule
   // below, which replaced the scheme and passed the payload through — and for

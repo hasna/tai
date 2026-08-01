@@ -89,6 +89,20 @@ test("removes the credentials segment of an Authorization header", () => {
 // before this was covered the header printed a marker at the front of a line
 // whose end was still a live signature.
 const SIGV4_SIGNATURE = "0000deadbeefsyntheticsignature1111notreal2222abcdef3333abcdef4444";
+const DIGEST_RESPONSE = "syntheticdigestresponse000000000000000000";
+
+test("removes a Digest Authorization response value", () => {
+  const cases = [
+    `Authorization: Digest username="synthetic-user", realm="synthetic", nonce="abc", response="${DIGEST_RESPONSE}"`,
+    `authorization=Digest username="synthetic-user", realm="synthetic", nonce="abc", response=${DIGEST_RESPONSE}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(DIGEST_RESPONSE);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
 
 test("removes an AWS SigV4 signature wherever it appears", () => {
   const cases = [
@@ -164,6 +178,8 @@ test("positive control: the absence assertion can fail", () => {
   // Same anchor for the SigV4 literal, so that test cannot pass vacuously either.
   const sigProse = `The build log mentioned ${SIGV4_SIGNATURE} in passing.`;
   expect(redactSensitiveText(sigProse)).toContain(SIGV4_SIGNATURE);
+  const digestProse = `The build log mentioned ${DIGEST_RESPONSE} in passing.`;
+  expect(redactSensitiveText(digestProse)).toContain(DIGEST_RESPONSE);
 });
 
 test("does not over-redact text that carries no credential", () => {
