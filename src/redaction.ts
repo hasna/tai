@@ -1,4 +1,21 @@
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
+type SecretReplacement = string | ((substring: string, ...args: any[]) => string);
+
+const NON_SECRET_AUTHORIZATION_VALUES = new Set([
+  "absent",
+  "allow",
+  "allowed",
+  "anonymous",
+  "denied",
+  "forbidden",
+  "invalid",
+  "missing",
+  "none",
+  "unauthorized"
+]);
+
+const AUTHORIZATION_PARAMETER_PATTERN = /(?:^|[\s,])[A-Za-z_][A-Za-z0-9_.-]{0,32}=(?!=)(?=\S)/;
+
+const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_OPENAI_KEY]"],
   [/\b(gsk_[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_GROQ_KEY]"],
   [/\b(csk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_CEREBRAS_KEY]"],
@@ -49,6 +66,14 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   //    identical run at 32; THIS COMMIT applies that same bound below, so the
   //    gap docs/redaction.md recorded is closed here rather than left open.
   //
+  // Parameterized Authorization schemes (`MAC mac=...`, custom HMAC schemes,
+  // and similar) are credential material even when their inner parameter name is
+  // not on a generic sensitive-key list. Redact that value before the
+  // field-preservation rule below has a chance to mask only the scheme token and
+  // leave `sig=...` or `nonce=...` beside a marker. Explicit non-secret status
+  // values such as `authorization=denied user=bob` keep their neighboring audit
+  // fields.
+  [/(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)([A-Za-z][A-Za-z0-9._-]*)(\s+)([^\r\n]*)/gi, redactParameterizedAuthorization],
   // Two further details, both found by adversarial review of the first attempt
   // at this rule and both measured:
   //
@@ -87,7 +112,29 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
 ];
 
 export function redactSensitiveText(value: string): string {
-  return SECRET_PATTERNS.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), value);
+  return SECRET_PATTERNS.reduce((text, entry) => applySecretPattern(text, entry), value);
+}
+
+function applySecretPattern(text: string, [pattern, replacement]: [RegExp, SecretReplacement]): string {
+  return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
+}
+
+function redactParameterizedAuthorization(
+  match: string,
+  prefix: string,
+  scheme: string,
+  spacer: string,
+  rest: string
+): string {
+  if (!AUTHORIZATION_PARAMETER_PATTERN.test(rest)) {
+    return match;
+  }
+
+  if (NON_SECRET_AUTHORIZATION_VALUES.has(scheme.toLowerCase())) {
+    return `${ prefix }[REDACTED]${ spacer }${ rest }`;
+  }
+
+  return `${ prefix }[REDACTED]`;
 }
 
 export function stripHiddenReasoning(value: string): string {

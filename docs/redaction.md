@@ -33,6 +33,7 @@ throughout — no real credential is used or rendered at any point.
 |---|---|
 | single-token `Authorization` values such as `Basic <b64>` or `Bearer <token>` (any scheme case) | redacted |
 | `Authorization: Digest ... response="<digest proof>"` | redacted |
+| parameterized `Authorization` schemes such as `Scheme sig=<proof>` or `MAC mac=<proof>` | redacted |
 | `authorization=Basic <b64>` — `=` instead of `:` | redacted |
 | `authorization = Basic <b64>` — spaces around the separator | redacted |
 | `HTTP_AUTHORIZATION=`, `AUTHORIZATION_HEADER=`, `authorization_header:` | redacted |
@@ -59,22 +60,22 @@ Two details are load-bearing and easy to undo by accident:
    either side rescans the remaining input from every position the literal
    matches, which is quadratic. A real key suffix is `_header` or similar, so the
    cap costs nothing.
-3. **The closing quote is optional and the scheme is not consumed across a
-   `key=value`.** Both were found by adversarial review of the first version of
-   this rule; see the covered table above. Neither is cosmetic — the first left a
-   credential in every truncated log line, the second deleted adjacent fields.
+3. **The closing quote is optional, and parameterized schemes are redacted before
+   adjacent-field preservation runs.** Both were found by adversarial review of
+   the first version of this rule; see the covered table above. Neither is
+   cosmetic — the first left a credential in every truncated log line, and the
+   second could either delete adjacent fields or leave `sig=...` beside a marker.
 
-   *Correction carried forward from #13 — the sibling's quadratic is
-   `URL_USERINFO_PATTERN`, not `redactNamedAssignments`.*
-Earlier versions of this note cited
-   `hasnaxyz/iapp-sms` as carrying a `~8.4s/50k` quadratic in
-   `redactNamedAssignments`. Per-pattern at n=50000 on a single repeated
-   character: `URL_USERINFO_PATTERN` 2947ms, `NAMED_ASSIGNMENT_PATTERN`
-   0.2ms. The difference is the **anchor**, not the star —
-   `NAMED_ASSIGNMENT_PATTERN` opens with `(^|[^A-Za-z0-9_-])` so an unbroken
-   alnum run has one viable start position, while `URL_USERINFO_PATTERN`
-   opens with a bare `[a-z]` and retries at every position. The `~8.4s`
-   figure was station01; `~2.9s` is station02. Quote the box with the number.
+**Correction carried forward from #13 — the sibling's quadratic is
+`URL_USERINFO_PATTERN`, not `redactNamedAssignments`.** Earlier versions of this
+note cited `hasnaxyz/iapp-sms` as carrying a `~8.4s/50k` quadratic in
+`redactNamedAssignments`. Per-pattern at n=50000 on a single repeated character:
+`URL_USERINFO_PATTERN` 2947ms, `NAMED_ASSIGNMENT_PATTERN` 0.2ms. The difference
+is the **anchor**, not the star — `NAMED_ASSIGNMENT_PATTERN` opens with
+`(^|[^A-Za-z0-9_-])` so an unbroken alnum run has one viable start position,
+while `URL_USERINFO_PATTERN` opens with a bare `[a-z]` and retries at every
+position. The `~8.4s` figure was station01; `~2.9s` is station02. Quote the box
+with the number.
 
 ### Performance, measured rather than asserted
 
@@ -114,14 +115,12 @@ that is this file working, not this file failing.
 | shape | class | why it is still open |
 |---|---|---|
 | bare `Bearer <token>` with no `authorization` key | honest gap | The only rule that closes it — `/Bearer\s+[A-Za-z0-9._~+/=-]+/gi`, which `hasnaxyz/iapp-sms` carries — over-redacts ordinary prose: `Bearer authentication is required` becomes `Bearer [REDACTED] is required`. Closing this gap would trade a marker-free gap for a real over-redaction regression. Deliberately deferred, not overlooked. |
-| a value **truncated before its closing quote**, e.g. a log line cut at a byte limit — `{"headers":{"authorization":"Basic <cred>` | honest gap | **Live.** The quoted alternative requires its closing `\2` and the unquoted branch cannot start, because `"` is excluded from `[^\s'"]+`. So the rule **does not match the line at all** and the whole line passes through **unredacted, with no `[REDACTED]` emitted anywhere**. That last part is the operationally important bit: **grepping logs for the marker to find affected lines will find none of them.** syslog truncates at 1024B; journald and CloudWatch truncate too, so this is a normal way a long JSON log line ends, not an edge case. `hasnaxyz/iapp-sms` closed this by making the closing quote optional (`\2?`); that fix has **not** been applied here. |
 | `Cookie: session=<tok>` | honest gap | **Live.** Nothing keys on `session`. An agent logging an HTTP request is exactly where this appears, and it is not covered by the structural row below — `session=` **is** a recognisable key, just not one this file recognises. |
 | `Set-Cookie: sid=<tok>; HttpOnly` | honest gap | **Live.** Same cause; `sid` is likewise not keyed on. |
 | URL userinfo — `scheme://user:<tok>@host` | honest gap | **Live.** `tai` has no userinfo rule at all. `hasnaxyz/iapp-sms` redacts this via `URL_USERINFO_PATTERN`; this is a genuine divergence, not a shared gap. |
 | PEM private key armour — a `-----BEGIN … PRIVATE KEY-----` block | honest gap | **Live.** No rule keys on PEM armour, and the body is bare base64 across newlines with no assignment shape to anchor on. (Written with an ellipsis on purpose so this row does not itself trip a secret scanner. Do not "fix" it back.) |
 | `authorization.value=Basic <cred>` — `.` as a key separator | honest gap | **Live.** The trailing key run is `[A-Za-z0-9_-]*`, which excludes `.`, so the match stops at `authorization` and never reaches the `=`. |
 | `authorization%3DBasic%20<cred>` — percent-encoded | honest gap | **Live.** Nothing percent-decodes free text before matching, so no key is ever seen. |
-| quadratic blow-up in the `authorization` key rule | availability, P2 | **Live.** 470ms for a 50k `HTTP_AUTHORIZATION_` run and 691ms for a 50k lowercase `authorization` run, both at **4.0x per doubling** (station02). Cause: the **trailing** `[A-Za-z0-9_-]*` rescans the remaining run from every position the literal matches. `hasnaxyz/iapp-sms` fixed the identical shape by bounding that run at 32, which restored 2.0x per doubling there; the bound has **not** been applied here. Not addressed in this change, which is documentation only — bounding the run alters what the pattern accepts and must be re-run against the over-redaction set. |
 | a bare high-entropy value with no recognisable key or prefix | honest gap | Structural. No keyword and no prefix means nothing to key on; this cannot be closed by pattern matching. |
 | quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling, ~324ms at 50k, byte-identical before and after this change. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. |
 | Unicode or non-ASCII spellings of header names | unmeasured | Never probed. Absence of a finding here is absence of evidence, not evidence of absence. |
@@ -150,17 +149,12 @@ produced wrong residual lists. Measured differences at the time of writing:
 - **Both are quadratic, on different inputs — an earlier version of this file
   implied `tai` was not.** On a 50k single repeated character `tai` is linear
   and fast (0.6ms) while `iapp-sms` is quadratic (2.9s, `URL_USERINFO_PATTERN`).
-  On a 50k `authorization`-dense run `tai` is quadratic (470ms, 4.0x per
-  doubling) while `iapp-sms` is now linear (0.7ms), because it bounded its
-  trailing key run at 32 and `tai` has not.
-- **`iapp-sms` has since diverged further and `tai` is behind on three fixes it
-  has not received**: the optional closing quote for truncated lines, the
-  bounded key run above, and preservation of the field beside the masked value.
-  Conversely `iapp-sms` alone carries a scheme-skip lookahead that reintroduces
-  a **misleading** leak for `Authorization: <Scheme> <non-sensitive-key>=<cred>`
-  (measured 5 of 9 keys there, **0 of 9 here**). Neither repo's residual list is
-  valid for the other — copying rows between them has already produced wrong
-  lists twice.
+  On a 50k `authorization`-dense run `tai` still has a generic-key quadratic
+  path, because the `[A-Z0-9_]*…[A-Z0-9_]*` rules can retry from many positions.
+- `tai` now carries the optional closing quote, bounded Authorization key run,
+  adjacent-field preservation, and parameterized Authorization scheme guards in
+  this file. Do not copy a residual list from another repo without re-running
+  that repo's exact source.
 
 A shared residual list would be wrong in a different direction for each repo.
 

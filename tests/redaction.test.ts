@@ -90,6 +90,7 @@ test("removes the credentials segment of an Authorization header", () => {
 // whose end was still a live signature.
 const SIGV4_SIGNATURE = "0000deadbeefsyntheticsignature1111notreal2222abcdef3333abcdef4444";
 const DIGEST_RESPONSE = "syntheticdigestresponse000000000000000000";
+const PARAMETERIZED_AUTH_CREDENTIAL = "syntheticparameterizedauthproof000000";
 
 test("removes a Digest Authorization response value", () => {
   const cases = [
@@ -100,6 +101,22 @@ test("removes a Digest Authorization response value", () => {
   for (const input of cases) {
     const redacted = redactSensitiveText(input);
     expect(redacted).not.toContain(DIGEST_RESPONSE);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
+
+test("removes key-value credential parameters from Authorization schemes", () => {
+  const cases = [
+    `Authorization: Scheme sig=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `Authorization: MAC mac=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `Authorization: Scheme nonce=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `Authorization: HMAC hash=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `authorization=Basic abc=${PARAMETERIZED_AUTH_CREDENTIAL}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(PARAMETERIZED_AUTH_CREDENTIAL);
     expect(redactSensitiveText(redacted)).toBe(redacted);
   }
 });
@@ -180,6 +197,8 @@ test("positive control: the absence assertion can fail", () => {
   expect(redactSensitiveText(sigProse)).toContain(SIGV4_SIGNATURE);
   const digestProse = `The build log mentioned ${DIGEST_RESPONSE} in passing.`;
   expect(redactSensitiveText(digestProse)).toContain(DIGEST_RESPONSE);
+  const parameterizedProse = `The build log mentioned ${PARAMETERIZED_AUTH_CREDENTIAL} in passing.`;
+  expect(redactSensitiveText(parameterizedProse)).toContain(PARAMETERIZED_AUTH_CREDENTIAL);
 });
 
 test("does not over-redact text that carries no credential", () => {
