@@ -137,23 +137,34 @@ test("removes a Digest response that sits far into a long header", () => {
 // ~2x per doubling and quadratic stays ~4x whether the box is idle or busy.
 const GROWTH_SIZES_KIB = [16, 32, 64] as const;
 
-function medianMillis(input: string, runs = 9): number {
-  // Warm up before sampling. Without it the first sample carries JIT compilation
-  // and shows up as a ratio outlier on a loaded box — measured flaking 1 run in
-  // 15 in-process against the 2.8 threshold. The threshold is sound; the
-  // estimator was the weak part.
+// TAKE THE FASTEST SAMPLE, NOT THE MEDIAN, and warm up before sampling. This
+// suite runs on contended boxes, and CPU contention is strictly ADDITIVE noise:
+// a sample can be slowed by another process but never sped up, so the minimum is
+// the sample closest to uncontended execution while the median drags with load.
+// A median-based estimator failed the newline control at ratio 6.40 on a box at
+// loadavg 25, and an adversarial reviewer measured it failing 2 runs in 10.
+//
+// This does NOT weaken the guard, which is the thing to check before changing an
+// estimator: a genuinely quadratic implementation has a quadratic minimum too,
+// so the naive mutant still returns ~4.0 here. Verified against the mutant after
+// the change, not assumed.
+function fastestMillis(input: string, runs = 9): number {
   redactSensitiveText(input);
-  const samples = Array.from({ length: runs }, () => {
+  let fastest = Infinity;
+  for (let run = 0; run < runs; run += 1) {
     const started = process.hrtime.bigint();
     redactSensitiveText(input);
-    return Number(process.hrtime.bigint() - started) / 1e6;
-  }).sort((a, b) => a - b);
-  return samples[Math.floor(samples.length / 2)];
+    const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+    if (elapsed < fastest) {
+      fastest = elapsed;
+    }
+  }
+  return fastest;
 }
 
 function growthPerDoubling(unit: string, separator: string): number {
   const times = GROWTH_SIZES_KIB.map((kib) =>
-    medianMillis(Array.from({ length: Math.floor((kib * 1024) / unit.length) }, () => unit).join(separator))
+    fastestMillis(Array.from({ length: Math.floor((kib * 1024) / unit.length) }, () => unit).join(separator))
   );
   const ratios = times.slice(1).map((time, index) => time / times[index]);
   return ratios.reduce((total, ratio) => total + ratio, 0) / ratios.length;
@@ -467,7 +478,7 @@ const RUN_GROWTH_SIZES_KIB = [8, 16, 32] as const;
 
 function runLengthGrowthPerDoubling(prefix: string): number {
   const times = RUN_GROWTH_SIZES_KIB.map((kib) =>
-    medianMillis(prefix + "x".repeat(kib * 1024 - prefix.length), 5)
+    fastestMillis(prefix + "x".repeat(kib * 1024 - prefix.length), 5)
   );
   const ratios = times.slice(1).map((time, index) => time / times[index]);
   return ratios.reduce((total, ratio) => total + ratio, 0) / ratios.length;
@@ -610,4 +621,43 @@ test("positive control: the round-1 assertions can fail", () => {
   expect(redactSensitiveText(`The log mentioned ${COOKIE_CREDENTIAL} in passing.`)).toContain(COOKIE_CREDENTIAL);
   expect(redactSensitiveText(`The log mentioned ${jwtShaped} in passing.`)).toContain(jwtShaped);
   expect(redactSensitiveText("The log mentioned SYNTHETICSESSIONID000000000000AB in passing.")).toContain("SYNTHETICSESSIONID000000000000AB");
+});
+
+test("a cookie value that is entirely delimiters is still masked", () => {
+  // A dangling delimiter is not a tidy edge case, it is a leak. `AUTH=",<cred>`
+  // tokenises to `AUTH="` — the comma is a pair separator — and leaving that
+  // token untouched left an OPEN QUOTE in the line. The generic `*AUTH*` rule
+  // downstream pairs `(["'])…\2`, so it mis-paired across to the next field's
+  // quote or declined to match, and the credential printed with NO marker. The
+  // same input was masked before the cookie rule existed, so the rule was making
+  // the line worse. Found by adversarial review, 13 hits in a 300,000-case sweep.
+  const cases = [
+    `cookie:AUTH=",${COOKIE_CREDENTIAL}`,
+    `Set-Cookie: AUTH=",${COOKIE_CREDENTIAL}`,
+    `Cookie:TOKEN="\tpassword="${COOKIE_CREDENTIAL}"`,
+    `Cookie: sid="`,
+    `Cookie: a=']}`,
+    `Set-Cookie: sid=";`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(COOKIE_CREDENTIAL);
+    // Idempotence broke here too — `api_key="; session="` masked to
+    // `api_key="[REDACTED]"` and then to `api_key=[REDACTED]"` on the next pass.
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+
+  expect(redactSensitiveText(`Set-Cookie: api_key="; session="`)).toBe(
+    redactSensitiveText(redactSensitiveText(`Set-Cookie: api_key="; session="`))
+  );
+
+  // The JSON structure this re-emission exists for must survive the fix — the
+  // cheaper repair (dropping quotes from the closer set) closes the leak but
+  // gives this back, so it is pinned rather than assumed.
+  expect(redactSensitiveText(`{"set-cookie": ["a=1", "sid=${COOKIE_CREDENTIAL}"]}`))
+    .toBe('{"set-cookie": ["a=[REDACTED]", "sid=[REDACTED]"]}');
+
+  // Positive control: the literal is findable when nothing masks it.
+  expect(redactSensitiveText(`log mentioned ${COOKIE_CREDENTIAL} once`)).toContain(COOKIE_CREDENTIAL);
 });

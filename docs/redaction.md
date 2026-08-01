@@ -107,6 +107,34 @@ Two details are load-bearing and easy to undo by accident:
    value that opens with the literal marker and continues into a real
    credential. `[REDACTED]` ends in `]`, so without the guard a second pass peels
    the bracket and grows `[REDACTED]]` on every run.
+8. **A value that is ENTIRELY closers is still masked, and skipping it was a
+   leak.** `cookie:AUTH=",<credential>` tokenises to `AUTH="` — the comma is a
+   pair separator — so its value is the single character `"`. An early return
+   that left such a token alone put a **dangling open quote** in the line, and
+   the generic `*AUTH*` rule downstream pairs `(["'])…\2`: it mis-paired across
+   to the next field's opening quote, or declined to match, and the credential
+   printed **with no marker at all**. The same input was masked before the cookie
+   rule existed, so the rule was making that line *worse* — the misleading-output
+   class this whole file is organised around, produced by the fix rather than by
+   the gap. Found by adversarial review at 13 occurrences in a 300,000-case
+   sweep, and it was also the root of a non-fixed-point on inputs such as
+   `Set-Cookie: api_key="; session="`. **Dropping `"` and `'` from the closer set
+   closes the leak too, and was rejected on measurement**: it also gives back the
+   JSON structure the re-emission exists for (`["a=[REDACTED], "sid=[REDACTED]]}`
+   against `["a=[REDACTED]", "sid=[REDACTED]"]}`). Masking the all-closer value
+   keeps both. Measured across 214,427 distinct fuzzed strings: 0 regressions and
+   0 non-fixed-points, where the early return produced 5,745 and 9,579.
+
+**On the fuzzing that found it, because the corpus was wrong first.** The
+reviewer's original generator used `s = (s*1103515245 + 12345) & 0x7fffffff`,
+whose multiply exceeds 2^53 — precision is lost and the sequence **cycles after
+10,579 states**. Two verdicts of "300,000 cases, 0 regressions" rested on roughly
+10.5k distinct draws wearing a six-figure number: *a vacuous corpus looks
+rigorous where a vacuous control looks thin*. Re-run with `mulberry32`
+(`Math.imul`, 32-bit throughout), 300,000 draws yield **214,427 distinct
+strings** and surfaced this defect immediately. Any figure quoted from a
+generated corpus in this file should be accompanied by its **distinct-string
+count**, not its draw count.
 
 ### A probe that PASSES FOR THE WRONG REASON hides a missing mechanism
 
@@ -312,6 +340,17 @@ separator and before any `=`.
 Sizes are chosen so the failing case fails *fast* — 8/16/32 KiB rather than
 32/64/128 — because **a test that can only fail by timing out reports its budget,
 not a duration.**
+
+**The estimator takes the FASTEST sample, not the median.** CPU contention is
+strictly *additive* noise — another process can slow a sample but never speed one
+up — so on a loaded box the minimum is the sample closest to uncontended
+execution while the median drags with load. A median-based estimator failed the
+newline control at ratio **6.40** at loadavg 25, and was measured failing 2 runs
+in 10. With the fastest sample the suite ran **6 of 6 green at loadavg ~21**.
+The thing to check before changing an estimator is whether it weakens the guard,
+and it does not: a quadratic implementation has a quadratic *minimum* too — the
+naive mutant still returns **3.99995** and still fails. Verified against the
+mutant after the change rather than assumed.
 
 The original two assertions are kept and relabelled as what they genuinely pin —
 the **outer** regex's start-position cost — with the measurement that the naive
