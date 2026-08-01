@@ -81,22 +81,49 @@ with the number.
 
 An earlier version of this file claimed this redactor had "no quadratic" and ran
 in "single-digit milliseconds". **That was wrong, and it was wrong about `main`
-as much as about the change that introduced the claim.** Measured on an idle
-host, interleaved in one process, input of repeated `HTTP_AUTHORIZATION_` tokens:
+as much as about the change that introduced the claim.** The quadratic is real:
+on repeated `HTTP_AUTHORIZATION_` tokens, growth is **4.0×/doubling** on every
+version measured, before and after. It is pre-existing and comes from the generic
+`[A-Z0-9_]*…[A-Z0-9_]*` key rules, not from the Authorization rule. It is listed
+as an open residual below rather than claimed absent.
 
-| | 6.25k | 12.5k | 25k | 50k | growth |
-|---|---|---|---|---|---|
-| `main` before this change | 5.1ms | 20.1ms | 80.7ms | 323.6ms | **4.0×/doubling** |
-| with this change | 5.1ms | 20.2ms | 80.5ms | 323.8ms | **4.0×/doubling** |
+**A SECOND CORRECTION, and it retracts this section's own previous numbers.**
+This section used to carry a table reading `323.6ms` before and `323.8ms` after
+at 50k, and concluded that the change "does not add to it, and does not remove
+it". **Both halves of that conclusion are false, in opposite directions, and the
+figures are not reproducible.** Re-measured per commit — station01, loadavg ~18,
+median of 9 reps after a warmup pass at every size, reproduced in two independent
+runs:
 
-So: **this redactor already had a quadratic path on that input, this change does
-not add to it, and this change does not remove it.** The growth ratio per
-doubling is the load-independent statistic — absolute figures move with machine
-load, ratios do not. On bare repeated characters both are linear (~0.5ms at 50k).
+| version | auth-dense 50k | digest-shape 50k |
+|---|---|---|
+| `main` before this change (`47de35d`) | 1420ms | 2.6ms |
+| commit 1 — truncation + adjacent-field (`9f52c8c`) | 923ms | 2.6ms |
+| commit 2 — Digest `response=` rule (`4b10ea5`) | 955ms | **65ms** |
+| merged (`62f8f14`) | 939ms | **60ms** |
 
-The quadratic is pre-existing and comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*`
-key rules, not from the Authorization rule. It is listed as an open residual
-below rather than claimed absent.
+Two effects, each attributable to one commit:
+
+* **auth-dense got ~34% FASTER**, from commit 1 onward — 0.65–0.67× `main`,
+  reproduced, and independently corroborated by two earlier measurements at
+  0.66–0.67×. Not parity.
+* **the digest shape got ~23× SLOWER**, and it starts exactly at commit 2, the
+  commit that introduces the `response=` rule. 2.6ms → 65ms at 50k.
+
+**The growth ratio, not the absolute figure, is what makes this checkable.** This
+section already said absolute numbers move with machine load while ratios do not
+— which is precisely why a *before/after ratio measured in one process on one
+box* is load-independent evidence, and why 0.66× cannot be explained away as
+"their host was busier". Growth stays 4.0×/doubling throughout, so the
+pre-existing quadratic is unchanged; what moved is the constant factor, in both
+directions.
+
+Note the digest regression is a **constant-factor** change, not a new quadratic:
+growth on that shape stays ~2.0×/doubling (linear) above 25k, with a reproducible
+threshold jump between 12.5k and 25k. Calling it "a new quadratic" would be a
+different and unsupported claim.
+
+On bare repeated characters both are linear (~0.5ms at 50k).
 
 ## Not covered — known residuals
 
@@ -122,7 +149,8 @@ that is this file working, not this file failing.
 | `authorization.value=Basic <cred>` — `.` as a key separator | honest gap | **Live.** The trailing key run is `[A-Za-z0-9_-]*`, which excludes `.`, so the match stops at `authorization` and never reaches the `=`. |
 | `authorization%3DBasic%20<cred>` — percent-encoded | honest gap | **Live.** Nothing percent-decodes free text before matching, so no key is ever seen. |
 | a bare high-entropy value with no recognisable key or prefix | honest gap | Structural. No keyword and no prefix means nothing to key on; this cannot be closed by pattern matching. |
-| quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling, ~324ms at 50k, byte-identical before and after this change. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. |
+| quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling on every version measured. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. The absolute cost is **not** unchanged by this change — see the performance section: auth-dense is 0.66× (faster), the digest shape ~23× (slower). A `~324ms at 50k, byte-identical` figure previously stood here and is retracted as unreproducible. |
+| digest-shape input costs ~23× more than before the `response=` rule | availability, P2 | **Live, and introduced by this change** at `4b10ea5`: a long `Authorization: Digest … response="` line goes 2.6ms → 60ms at 50k on station01. Growth stays linear (~2.0×/doubling), so this is a constant-factor regression rather than a new quadratic. Untriaged: the rule is correct and the input is adversarial-shaped, so this is a cost question, not a correctness one. |
 | Unicode or non-ASCII spellings of header names | unmeasured | Never probed. Absence of a finding here is absence of evidence, not evidence of absence. |
 | whether every runtime call site actually routes through this function | unmeasured | This file measures the function, not its callers. A correct redactor on a path nothing calls redacts nothing. |
 
