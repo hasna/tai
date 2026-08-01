@@ -15,6 +15,11 @@ const NON_SECRET_AUTHORIZATION_VALUES = new Set([
 
 const AUTHORIZATION_PARAMETER_PATTERN = /(?:^|[\s,])[A-Za-z_][A-Za-z0-9_.-]{0,32}=(?!=)(?=\S)/;
 
+// Applied to ONE Digest header value at a time by redactDigestResponse, never
+// to the whole input. Scoping it that way is what keeps the scan linear — see
+// the note above the Digest entry in SECRET_PATTERNS.
+const DIGEST_RESPONSE_PATTERN = /(\bresponse\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|[^\s'",]+)/gi;
+
 const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_OPENAI_KEY]"],
   [/\b(gsk_[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_GROQ_KEY]"],
@@ -24,7 +29,59 @@ const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   // Mask it before the broader Authorization rule below replaces the scheme
   // token; otherwise the line can still print a marker while the response
   // survives beside it.
-  [/(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*Digest\s+[^\r\n]*?\bresponse\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|[^\s'",]+)/gi, "$1$2[REDACTED]$2"],
+  //
+  // THIS RULE WAS A ReDoS UNTIL THIS COMMIT, and the shape it shipped in is
+  // worth keeping written down because it reads as harmless:
+  //
+  //   ...Digest\s+[^\r\n]*?\bresponse\s*=
+  //
+  // The lazy `[^\r\n]*?` rescans to END-OF-LINE from every position where
+  // `authorization...Digest` matches. Many matches on one line is O(n^2); a
+  // newline bounds each rescan, so ordinary multi-line log text stayed linear
+  // and the defect never showed up in normal use. Measured on station02
+  // (loadavg 1.23), repeated `Authorization: Digest ` on a single line:
+  // 10.2 / 40.1 / 159.4 / 635.9 ms at 16/32/64/128 KiB — 3.94x, 3.97x, 3.99x
+  // per doubling. The identical bytes newline-separated: 2.9 ms at 128 KiB.
+  //
+  // The cost is the SCAN DISTANCE, not the number of matches. The control that
+  // settles that: a 128 KiB single line carrying 3971 `Digest` occurrences whose
+  // scan terminates immediately (`Digest response=x `) runs in 0.5 ms, while
+  // 5957 occurrences whose scan runs to end-of-line take 636.1 ms.
+  //
+  // Reachable from two call sites, which is what makes it a ReDoS rather than a
+  // slow function: agentic.ts bounds shell output at maxBuffer 128 KiB (its
+  // `.slice(0, 12000)` runs AFTER redaction and so bounds nothing), and
+  // mcp/index.ts passes caller-supplied tool text with no bound at all. The
+  // runtime is single-threaded, so this blocks the event loop.
+  //
+  // THE FIX IS A RESTRUCTURE, NOT A BOUND. The obvious repair is to cap the
+  // lazy scan — `[^\r\n]{0,256}?` — and the honest reason that was not chosen is
+  // NOT that it stays quadratic. It does not: measured on the same box and the
+  // same shape, the bounded form is 0.6 / 1.2 / 2.5 / 4.8 ms across
+  // 16/32/64/128 KiB, 1.99x per doubling — linear, because the cap makes the
+  // per-position scan a constant. (An earlier draft of this comment asserted
+  // O(n*N) and was wrong; the measurement is recorded here rather than the
+  // prediction.)
+  //
+  // The bound loses on the other axis instead, which is the one this file
+  // cares about: a cap declines to look past N, so a `response=` sitting
+  // further into a header is not seen by this rule at all. A Digest header
+  // carries `nonce`, `uri`, `opaque` and `cnonce` ahead of `response`, none
+  // bounded by the RFC. On the shapes tested, the broader Authorization rule
+  // below happens to mask such a header anyway — but that makes a leak rule
+  // depend on a different rule as its safety net, which is not a property to
+  // rely on when the two are edited separately. The restructure carries no
+  // ceiling, so no input that was redacted before stops being redacted, and it
+  // is also about 2x faster than the bounded form (2.3 ms vs 4.8 ms at
+  // 128 KiB). Instead the header value is captured whole and
+  // scanned once: `[^\r\n]*` has nothing after it, so it never backtracks, and
+  // because the match CONSUMES to end-of-line every later `authorization...
+  // Digest` on that line falls inside it and is never retried as a fresh start
+  // position. `response=` is then masked inside that one captured value, where
+  // the scan is bounded by the header rather than by a magic number. No length
+  // ceiling is introduced, so nothing that was redacted before stops being
+  // redacted.
+  [/(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*Digest\s+)([^\r\n]*)/gi, redactDigestResponse],
   // Consume the scheme AND the credentials that follow it. Matching only
   // `Bearer` left `Authorization: Basic <base64>` to the generic key:value rule
   // below, which replaced the scheme and passed the payload through — and for
@@ -117,6 +174,25 @@ export function redactSensitiveText(value: string): string {
 
 function applySecretPattern(text: string, [pattern, replacement]: [RegExp, SecretReplacement]): string {
   return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
+}
+
+// Masks `response=` inside a SINGLE Digest header value. Splitting the rule
+// this way is what removes the quadratic: the caller has already consumed the
+// header to end-of-line, so this scan is bounded by one header rather than by
+// the whole input, and it cannot be re-entered from a later start position on
+// the same line.
+//
+// Applying it with `g` masks every `response=` in the value rather than only
+// the first. That is intentionally wider than the pattern it replaces: a second
+// Digest header sharing the line is covered without relying on the outer rule
+// being re-entered, and over-masking a parameter literally named `response`
+// inside an Authorization header is the cheap direction of that trade.
+//
+// A value with no `response=` comes back byte-identical, so this rule never
+// alters a line it has nothing to say about, and the broader Authorization
+// rules below still see exactly the text they saw before.
+function redactDigestResponse(match: string, prefix: string, headerValue: string): string {
+  return `${ prefix }${ headerValue.replace(DIGEST_RESPONSE_PATTERN, "$1$2[REDACTED]$2") }`;
 }
 
 function redactParameterizedAuthorization(
