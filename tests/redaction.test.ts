@@ -316,3 +316,145 @@ test("does not over-redact text that carries no credential", () => {
 test("strips hidden reasoning blocks", () => {
   expect(stripHiddenReasoning("<think>private</think>{\"command\":\"ls\",\"summary\":\"list\"}")).toBe("{\"command\":\"ls\",\"summary\":\"list\"}");
 });
+
+// ---------------------------------------------------------------------------
+// Cookie headers. A `Cookie:` / `Set-Cookie:` value is a THIRD delimiter role:
+// the header value is itself a `;`-delimited list of `name=value` pairs, and the
+// credential is one pair among several. Nothing in this file keyed on that
+// shape, so every cookie below survived verbatim on a PUBLIC repository whose
+// SECURITY.md points readers at docs/redaction.md.
+//
+// Synthetic, never-issued. Deliberately carries no substring any other rule in
+// this file keys on — no `token`, `secret`, `auth`, `key`, `sk-`, `gsk_`. A
+// fixture that another rule happens to catch cannot detect a cookie rule at all,
+// and that is not hypothetical: `__Secure-next-auth.session-token=<value>` was
+// ALREADY redacted before this change, purely because the generic `*TOKEN*` key
+// rule matched the substring `token` in the cookie NAME. One spelling covered by
+// an unrelated rule is exactly what makes a family read as handled.
+const COOKIE_CREDENTIAL = "syntheticcookievalue0000notreal1111";
+
+test("removes cookie values from Cookie and Set-Cookie headers", () => {
+  const cases = [
+    // AXIS: cookie name. Names are chosen by the application, so any list of
+    // "session-ish" names fails open on the next framework. None of these
+    // contains a substring another rule in this file keys on.
+    `Cookie: session=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=${COOKIE_CREDENTIAL}`,
+    `Cookie: PHPSESSID=${COOKIE_CREDENTIAL}`,
+    `Cookie: JSESSIONID=${COOKIE_CREDENTIAL}`,
+    `Cookie: connect.sid=${COOKIE_CREDENTIAL}`,
+    `Cookie: laravel_session=${COOKIE_CREDENTIAL}`,
+    `Cookie: _csrf=${COOKIE_CREDENTIAL}`,
+    `Cookie: __Host-sid=${COOKIE_CREDENTIAL}`,
+    `Cookie: __Secure-sid=${COOKIE_CREDENTIAL}`,
+    // AXIS: header spelling and case. `Set-Cookie` is the response direction and
+    // leaks the same value; `\b` would never have matched inside `HTTP_COOKIE`.
+    `Set-Cookie: sid=${COOKIE_CREDENTIAL}`,
+    `set-cookie: sid=${COOKIE_CREDENTIAL}`,
+    `SET-COOKIE: SID=${COOKIE_CREDENTIAL}`,
+    `HTTP_COOKIE=session=${COOKIE_CREDENTIAL}`,
+    `cookie_header: sid=${COOKIE_CREDENTIAL}`,
+    // AXIS: separator, and whitespace around it.
+    `cookie=sid=${COOKIE_CREDENTIAL}`,
+    `cookie = sid=${COOKIE_CREDENTIAL}`,
+    `Cookie:sid=${COOKIE_CREDENTIAL}`,
+    // AXIS: position of the credential-bearing pair among several. A rule that
+    // only reaches the first pair passes the single-pair cases above.
+    `Cookie: theme=dark; sid=${COOKIE_CREDENTIAL}; lang=en`,
+    `Cookie: a=1; b=2; c=3; sid=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=${COOKIE_CREDENTIAL}; theme=dark`,
+    // AXIS: quoting, including the truncated line that syslog/journald/CloudWatch
+    // produce — the closing quote is simply absent.
+    `{"headers":{"cookie":"session=${COOKIE_CREDENTIAL}"}}`,
+    `{"Set-Cookie": "sid=${COOKIE_CREDENTIAL}; Path=/"}`,
+    `cookie='sid=${COOKIE_CREDENTIAL}'`,
+    `{"lvl":"info","headers":{"cookie":"sid=${COOKIE_CREDENTIAL}`,
+    // AXIS: Set-Cookie attributes trailing the pair.
+    `Set-Cookie: sid=${COOKIE_CREDENTIAL}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+    `Set-Cookie: sid=${COOKIE_CREDENTIAL}; Expires=Wed, 09 Jun 2027 10:18:14 GMT; Max-Age=3600`,
+    // AXIS: an attribute NAME reused as a cookie name. The exemption that keeps
+    // `Path=/` readable must not become a way to smuggle a credential past it.
+    `Set-Cookie: sid=1; path=${COOKIE_CREDENTIAL}`,
+    `Cookie: domain=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; path=/${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; domain=${COOKIE_CREDENTIAL}.example`,
+    // AXIS: not at the start of the line, and more than one header per input.
+    `req GET /v1 cookie: sid=${COOKIE_CREDENTIAL} done`,
+    `Cookie: sid=${COOKIE_CREDENTIAL}\nAuthorization: Bearer ${BEARER_CREDENTIALS}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    // Assert the CREDENTIAL IS GONE. A `[REDACTED]`-present assertion would pass
+    // against `Cookie: session=<live value>` unchanged, because other rules on
+    // the same line can print a marker.
+    expect(redacted).not.toContain(COOKIE_CREDENTIAL);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
+
+test("positive control: the cookie absence assertion can fail", () => {
+  // Without this, `not.toContain(COOKIE_CREDENTIAL)` could be passing because the
+  // literal never survives anything, rather than because a cookie rule masked it.
+  const prose = `The build log mentioned ${COOKIE_CREDENTIAL} in passing.`;
+  expect(redactSensitiveText(prose)).toContain(COOKIE_CREDENTIAL);
+
+  // …and the paired must-redact control, so the two point in opposite directions:
+  // the same literal under a shape this file already covers IS removed.
+  expect(redactSensitiveText(`Authorization: Bearer ${COOKIE_CREDENTIAL}`)).not.toContain(COOKIE_CREDENTIAL);
+});
+
+test("keeps Set-Cookie attributes and neighbouring log fields readable", () => {
+  // Over-redaction that DESTROYS context is its own defect — a masked cookie
+  // whose Path/Domain/Expires went with it loses the forensic value of the log
+  // line. RFC 6265's attribute vocabulary is CLOSED, which is what makes an
+  // attribute exemption safe where a cookie-name allowlist would not be: an
+  // unrecognised name is treated as a cookie and masked.
+  const attributed = `Set-Cookie: sid=${COOKIE_CREDENTIAL}; Path=/admin; Domain=example.test; Max-Age=3600; SameSite=Lax; Expires=Wed, 09 Jun 2027 10:18:14 GMT; HttpOnly; Secure`;
+  const redacted = redactSensitiveText(attributed);
+  expect(redacted).not.toContain(COOKIE_CREDENTIAL);
+  for (const survivor of ["Path=/admin", "Domain=example.test", "Max-Age=3600", "SameSite=Lax", "Expires=Wed, 09 Jun 2027 10:18:14 GMT", "HttpOnly", "Secure"]) {
+    expect(redacted).toContain(survivor);
+  }
+
+  // A cookie header sitting mid-line must not turn the rest of the line into
+  // markers. RFC 6265 delimits cookie pairs with `;` — whitespace-separated
+  // `key=value` text after the header is ordinary log context, not a cookie.
+  const inline = `cookie: sid=${COOKIE_CREDENTIAL} status=200 user=bob duration=1.5s`;
+  const inlineRedacted = redactSensitiveText(inline);
+  expect(inlineRedacted).not.toContain(COOKIE_CREDENTIAL);
+  for (const survivor of ["status=200", "user=bob", "duration=1.5s"]) {
+    expect(inlineRedacted).toContain(survivor);
+  }
+
+  // Prose that merely contains the word must come back byte-identical.
+  for (const safe of [
+    "Cookie consent is handled by the gateway.",
+    "The cookie policy changed in June.",
+    "cookies: chocolate and vanilla"
+  ]) {
+    expect(redactSensitiveText(safe)).toBe(safe);
+  }
+});
+
+test("the cookie rule stays linear on a cookie-dense single line", () => {
+  // Same instrument as the Digest pair above: a GROWTH RATIO, not a millisecond
+  // figure, because the exponent does not move with machine load. The naive
+  // inner pattern for this rule — /([^\s;,=]+)=([^\s;,]*)/g — was measured at
+  // 3.98x/3.99x/4.00x per doubling on a long run carrying no `=` at all, which
+  // is why the implementation scans linearly instead of matching pairs.
+  //
+  // This is the adversarial shape for that pattern: header keys with no
+  // separator, so every start position that matches the literal must scan and
+  // fail.
+  expect(growthPerDoubling("Cookie: sid=a; b=c; ", "")).toBeLessThan(2.8);
+  expect(growthPerDoubling("cookiecookiecookie", "")).toBeLessThan(2.8);
+});
+
+test("newline-separated cookie control: identical bytes, bounded rescans", () => {
+  // The PAIR is the signal. If a future change makes the cookie rule rescan to
+  // end-of-line from every start position, the single-line shape above goes
+  // quadratic while this one stays flat. One timing alone cannot tell "the regex
+  // got slow" from "the box got busy".
+  expect(growthPerDoubling("Cookie: sid=a; b=c; ", "\n")).toBeLessThan(2.8);
+});

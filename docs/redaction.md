@@ -43,6 +43,12 @@ throughout — no real credential is used or rendered at any point.
 | `{"Authorization": "Basic <b64>"}` and nested serialized JSON | redacted |
 | quoted, single-quoted and `export`-prefixed spellings | redacted |
 | AWS SigV4 trailing `Signature=`, bare / in-header / in a query string | redacted |
+| `Cookie:` / `Set-Cookie:` — **every** `;`-delimited pair value, whatever the cookie is named (`session`, `sid`, `PHPSESSID`, `JSESSIONID`, `connect.sid`, `laravel_session`, `__Host-*`, `__Secure-*`) | redacted |
+| the same, in any header spelling: `set-cookie:`, `HTTP_COOKIE=`, `cookie_header:`, `cookie=`, `cookie = `, `{"cookie":"…"}`, `'…'`, and a line truncated before its closing quote | redacted |
+| a credential-bearing pair that is **not first** in the header — `Cookie: theme=dark; sid=<tok>; lang=en` | redacted |
+| an RFC 6265 attribute name reused as a request cookie name — `Cookie: sid=1; path=/<tok>` / `domain=<tok>.example` | redacted |
+| Set-Cookie attributes (`Path`, `Domain`, `Expires`, `Max-Age`, `SameSite`, `HttpOnly`, `Secure`, …) beside a masked cookie | preserved |
+| ordinary log fields beside a cookie header (`cookie: sid=<tok> status=200 user=bob`) | preserved |
 | a line **truncated mid-value** by a byte limit, so the closing quote is missing | redacted |
 | the value masked **without deleting the fields beside it** (`authorization=denied user=bob` keeps `user=bob`) | preserved |
 | `sk-`, `gsk_`, `csk-`, `AKIA…` provider keys | redacted |
@@ -65,6 +71,56 @@ Two details are load-bearing and easy to undo by accident:
    the first version of this rule; see the covered table above. Neither is
    cosmetic — the first left a credential in every truncated log line, and the
    second could either delete adjacent fields or leave `sig=...` beside a marker.
+4. **The cookie rule's exemption table lists ATTRIBUTES, not cookie names, and
+   that direction is the whole point.** Cookie names are chosen by the
+   application and are unbounded, so a table of credential-bearing names fails
+   OPEN on the next framework. RFC 6265 §4.1.1 fixes the *attribute* vocabulary,
+   and RFC 6265bis adds `Partitioned` — a closed set. The exemption is applied
+   only in the `Set-Cookie` direction; request `Cookie` headers have no
+   attributes, so every pair is masked even when its name is `path`, `domain` or
+   another RFC attribute word. In `Set-Cookie`, the attribute's **value shape** is
+   checked as well as its name, and the **first pair is never exempt**, so
+   `Set-Cookie: sid=1; path=<credential>` does not walk through the exemption.
+   Both properties are pinned by tests.
+
+### A probe that PASSES FOR THE WRONG REASON hides a missing mechanism
+
+This is a distinct failure from the one the rest of this file guards against, and
+it is worth naming because the defence against it is different.
+
+The known hazard is a check that **cannot fail** — a grep whose pattern cannot
+match, an absence claim from a truncated read. The defence is a positive control.
+This is the other shape: a check that **passes, correctly, for a reason unrelated
+to the capability being checked**. A positive control does not catch it, because
+the instrument really does fire.
+
+Measured on `main` at `b75e651`, before this change, with the same synthetic
+value in every row:
+
+| shape | result before the cookie rule existed | why |
+|---|---|---|
+| `Cookie: __Secure-next-auth.session-token=<value>` | **redacted** | the generic `*TOKEN*` key rule matched the substring `token` in the cookie **name** |
+| `Cookie: session=<value>` | leaked | — |
+| `Cookie: sid=<value>` | leaked | — |
+| `Cookie: PHPSESSID=<value>` | leaked | — |
+| `Set-Cookie: sid=<value>; Path=/; HttpOnly` | leaked | — |
+
+Nine of ten cookie shapes leaked. **There was no cookie handling in this file at
+all** — and yet a reviewer's most likely single spot-check came back clean,
+because the cookie name people reach for first tends to contain the word `token`
+or `auth`. An incidental match by an unrelated rule masked an entirely absent
+mechanism, and would have gone on masking it.
+
+Two consequences, both applied here:
+
+1. **A fixture must not contain a substring any other rule keys on.**
+   `COOKIE_CREDENTIAL` in `tests/redaction.test.ts` deliberately carries no
+   `token`, `secret`, `auth`, `key`, `sk-` or `gsk_`. A fixture another rule
+   happens to catch cannot detect the rule under test.
+2. **Vary the axis the capability lives on, and check that the *majority* of it
+   behaves the same way.** One passing shape out of a family is evidence about
+   that shape, never about the family. Here the family is the cookie *name*,
+   which the application chooses and which is therefore unbounded.
 
 **Correction carried forward from #13 — the sibling's quadratic is
 `URL_USERINFO_PATTERN`, not `redactNamedAssignments`.** Earlier versions of this
@@ -153,6 +209,48 @@ On bare repeated characters every version above is linear, but the `~0.5ms at
 at 50k, `47de35d` ranges `-` 1.7ms through `a` 3.7ms, `62f8f14` ranges 1.8–2.8ms.
 The cost is character-dependent, so quote the character with the number.
 
+#### The cookie rule: the ReDoS that was measured BEFORE it was written
+
+The natural way to mask every pair inside a captured cookie header is one global
+regex, `/([^\s;,=]+)=([^\s;,]*)/g`. **It is quadratic, and this repo shipped a
+ReDoS inside a credential-leak fix once already**, so it was measured before being
+written rather than after.
+
+Adversarial input — one run of non-delimiter characters carrying **no `=` at
+all**, so every start position must scan the run and fail. station01, loadavg
+10.3, `bun`:
+
+| 1 KiB | 2 KiB | 4 KiB | 8 KiB | ratios |
+|---|---|---|---|---|
+| 3.60ms | 14.35ms | 57.22ms | 228.89ms | **3.98× / 3.99× / 4.00×** |
+
+A first probe at 16–128 KiB had to be killed at 120s. The mechanism: `[^\s;,=]+`
+followed by a literal `=` backtracks across the whole run at every start position,
+and every retry position holds a character that is *by construction* not `=`.
+128 KiB is exactly the `maxBuffer` bound in `src/agentic.ts`, and
+`src/mcp/index.ts` applies no bound at all — the same two call sites that made the
+Digest quadratic a ReDoS rather than a slow function.
+
+So the header value is captured by regex and then scanned by a **hand-written
+single forward pass** (`redactCookiePairs`). Every character is visited once and
+nothing is re-scanned, so it is linear *by construction* rather than by
+measurement. Shipped behaviour, base `b75e651` vs this change, median of 9 after a
+warmup, 16/32/64/128 KiB:
+
+| shape | base ratios | this change | absolute @128 KiB |
+|---|---|---|---|
+| cookie-dense, one line | 1.99 / 1.95 / 2.01 | 2.05 / 1.91 / 1.97 | 22.8ms → 20.2ms |
+| cookie-dense, newline-separated (control) | 2.02 / 2.01 / 1.98 | 2.05 / 1.91 / 1.97 | 22.5ms → 18.1ms |
+| `cookie` literal repeated, **no separator** | 2.05 / 2.00 / 2.02 | 2.01 / 2.01 / 2.01 | 4.2ms → 8.4ms |
+| digest-dense, one line | 2.03 / 1.88 / 2.03 | 1.97 / 2.00 / 1.99 | 7.0ms → 7.0ms |
+| auth-dense, the pre-existing quadratic | 3.94 / 4.00 / 4.04 | 3.95 / 3.97 / 4.02 | 1612.0ms → 1613.4ms @64 KiB |
+
+The last row is the honest one: **the pre-existing generic-key quadratic is
+neither added to nor removed by this change** — 1612.0ms against 1613.4ms is
+parity, and it stays listed as an open residual below. The `cookie`-literal row
+costs 2× the base constant because a rule that did not exist now runs; the
+exponent is unchanged.
+
 ## Not covered — known residuals
 
 **Known leaking shapes measured at `127ffc4` on 2026-07-31 (UTC), station02.
@@ -167,21 +265,42 @@ not probed at all. The list therefore tells you **scope, never
 completeness**. If you find a shape that leaks and is not here, add a row —
 that is this file working, not this file failing.
 
+**A corpus's coverage is bounded by its AXES, not its size — so name them.** The
+cookie work added a 32-shape coverage corpus and a 251-shape A/B output-drift
+corpus (base vs this change, 0 drift, with a positive control proving the
+comparison *can* report drift). Between them they vary: cookie **name**; header
+**spelling** and **case**; **separator** (`:` / `=` / spaced); **quoting**
+(bare / double / single / unterminated); the credential's **position** among
+several pairs; **pair count**; presence of **Set-Cookie attributes**; an
+attribute name **reused** as a cookie name; header **position within the line**;
+and **multi-line** inputs.
+
+**Axes they do NOT vary, and the defect class demonstrably lives on some of
+them:** any **encoding** of the header name or separator (percent-encoding,
+Unicode/fullwidth, HTML entities), and **line folding**. Both were probed
+separately after the fact and both leak — see the rows below. No amount of
+additional shapes along the axes above would have found either, because the
+generators cannot express them.
+
 | shape | class | why it is still open |
 |---|---|---|
 | bare `Bearer <token>` with no `authorization` key | honest gap | The only rule that closes it — `/Bearer\s+[A-Za-z0-9._~+/=-]+/gi`, which `hasnaxyz/iapp-sms` carries — over-redacts ordinary prose: `Bearer authentication is required` becomes `Bearer [REDACTED] is required`. Closing this gap would trade a marker-free gap for a real over-redaction regression. Deliberately deferred, not overlooked. |
-| `Cookie: session=<tok>` | honest gap | **Live.** Nothing keys on `session`. An agent logging an HTTP request is exactly where this appears, and it is not covered by the structural row below — `session=` **is** a recognisable key, just not one this file recognises. |
-| `Set-Cookie: sid=<tok>; HttpOnly` | honest gap | **Live.** Same cause; `sid` is likewise not keyed on. |
+| ~~`Cookie: session=<tok>`~~ | — | **CLOSED.** Covered by the cookie rule; see the covered table above. |
+| ~~`Set-Cookie: sid=<tok>; HttpOnly`~~ | — | **CLOSED.** Same rule. |
+| a cookie pair separated from the header by **whitespace only**, `Cookie: a=1 sid=<tok>` | honest gap | **Live**, and deliberate. RFC 6265 delimits cookie pairs with `;`, so the rule masks a pair only when it opens the header or follows a `;` or `,`. Without that condition a cookie header sitting mid-line turns the rest of the line into markers — `cookie: sid=<tok> status=200 user=bob` would lose `status` and `user`, which is the adjacent-field destruction this file has already had to fix once. Browsers and servers emit `; `, so the shape is non-conformant. Measured: `Cookie: a=1 sid=<tok>` → `a=[REDACTED] sid=<tok>`. |
+| a **non-conformant cookie value containing whitespace**, `Cookie: sid=abc def` | honest gap | **Live**, same cause. `cookie-octet` excludes SP, so a value with an interior space is not a cookie value; the rule masks up to the space. Measured: `Cookie: sid=abcSYNTH defSYNTH` → `sid=[REDACTED] defSYNTH`. |
+| ~~a request Cookie credential that happens to match an attribute's value shape, under that attribute's name and not in first position — `Cookie: a=1; path=/<tok>`~~ | — | **CLOSED.** Request `Cookie` headers no longer apply the `Set-Cookie` attribute exemption; `Cookie: a=1; path=/<tok>` and the domain-shaped equivalent are masked. `Set-Cookie` attributes remain preserved. |
+| **obs-fold** — a header value continued on the next line with leading whitespace | honest gap | **Live**, and shared with every other rule in this file: each value class excludes `\r\n`, so a folded continuation is never part of the match. Measured: `Cookie: a=1;\n sid=<tok>` → the continuation survives. Obsolete since RFC 7230 §3.2.4 but still produced by some proxies. |
 | URL userinfo — `scheme://user:<tok>@host` | honest gap | **Live.** `tai` has no userinfo rule at all. `hasnaxyz/iapp-sms` redacts this via `URL_USERINFO_PATTERN`; this is a genuine divergence, not a shared gap. |
 | PEM private key armour — a `-----BEGIN … PRIVATE KEY-----` block | honest gap | **Live.** No rule keys on PEM armour, and the body is bare base64 across newlines with no assignment shape to anchor on. (Written with an ellipsis on purpose so this row does not itself trip a secret scanner. Do not "fix" it back.) |
 | `authorization.value=Basic <cred>` — `.` as a key separator | honest gap | **Live.** The trailing key run is `[A-Za-z0-9_-]*`, which excludes `.`, so the match stops at `authorization` and never reaches the `=`. |
-| `authorization%3DBasic%20<cred>` — percent-encoded | honest gap | **Live.** Nothing percent-decodes free text before matching, so no key is ever seen. |
+| `authorization%3DBasic%20<cred>` — percent-encoded | honest gap | **Live.** Nothing percent-decodes free text before matching, so no key is ever seen. **Measured to apply to the cookie rule identically**: `cookie%3Dsid%3D<tok>` and `cookie%3A%20sid%3D<tok>` both survive. It is one gap in the decoding layer, not one per rule. |
 | a bare high-entropy value with no recognisable key or prefix | honest gap | Structural. No keyword and no prefix means nothing to key on; this cannot be closed by pattern matching. |
 | quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling on every version measured. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. The absolute cost is **not** unchanged by this change — see the performance section: auth-dense is 0.66× (faster). A `~324ms at 50k, byte-identical` figure previously stood here and is retracted as unreproducible. |
 | **NEW quadratic in the `response=` rule, on repeated `Authorization: Digest` within one line** | availability, **P1** | **Live, and introduced by this change** at `4b10ea5`. 2.0ms → 267ms at 50k and 4.3ms → 1060ms at 100k, **3.97×/doubling**, widening with n — a complexity-class change, not a constant factor. The same bytes newline-separated stay linear, which locates the cause in the `[^\r\n]*?` scan to end-of-line. **Reachable** — see the ReDoS row below. Tracked as `a0b7904f`; deliberately NOT fixed in the docs change that recorded it, because a documentation PR must not quietly alter redaction behaviour. |
 | digest, **unterminated** single-header shape costs ~23× more | availability, P2 | **Live, same origin** (`4b10ea5`): 2.6ms → 60ms at 50k. On *this* shape growth stays linear (~1.9×/doubling), so it is a constant-factor regression. Recorded separately from the row above because the two shapes differ in complexity class, and an earlier version of this file generalised from this one and got the other wrong. |
 | the `response=` quadratic is reachable from real call sites | **ReDoS, P1** | **Live.** `src/agentic.ts:97-98,105-106` redacts shell stdout/stderr — and `redactSensitiveText(stdout).slice(0, 12000)` truncates **after** redaction, so the 12k slice does **not** bound the regex input; the real bound is `maxBuffer: 128 * 1024`. Measured at 128KiB: **7ms → 2339ms**. `src/mcp/index.ts:107` redacts caller-supplied MCP tool text with **no maxBuffer at all**: at 512KiB, **30ms → 29058ms**. Single-threaded runtime, so this blocks the event loop. Anyone who can influence command output or call the MCP tool can spend it. |
-| Unicode or non-ASCII spellings of header names | unmeasured | Never probed. Absence of a finding here is absence of evidence, not evidence of absence. |
+| Unicode or non-ASCII spellings of header names | honest gap | **Live, and now measured** rather than merely suspected: a fullwidth `ｃookie: sid=<tok>` survives, because every key pattern in this file is an ASCII literal and nothing normalises the input first. Previously listed here as *unmeasured*; one probe moved it. The same is expected — but **not** measured — for the `authorization` and `signature` keys. |
 | whether every runtime call site actually routes through this function | unmeasured | This file measures the function, not its callers. A correct redactor on a path nothing calls redacts nothing. |
 
 **Over-masking that is intentional, stated so it is not mistaken for a bug.**
