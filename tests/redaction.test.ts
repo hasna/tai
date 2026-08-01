@@ -89,6 +89,37 @@ test("removes the credentials segment of an Authorization header", () => {
 // before this was covered the header printed a marker at the front of a line
 // whose end was still a live signature.
 const SIGV4_SIGNATURE = "0000deadbeefsyntheticsignature1111notreal2222abcdef3333abcdef4444";
+const DIGEST_RESPONSE = "syntheticdigestresponse000000000000000000";
+const PARAMETERIZED_AUTH_CREDENTIAL = "syntheticparameterizedauthproof000000";
+
+test("removes a Digest Authorization response value", () => {
+  const cases = [
+    `Authorization: Digest username="synthetic-user", realm="synthetic", nonce="abc", response="${DIGEST_RESPONSE}"`,
+    `authorization=Digest username="synthetic-user", realm="synthetic", nonce="abc", response=${DIGEST_RESPONSE}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(DIGEST_RESPONSE);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
+
+test("removes key-value credential parameters from Authorization schemes", () => {
+  const cases = [
+    `Authorization: Scheme sig=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `Authorization: MAC mac=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `Authorization: Scheme nonce=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `Authorization: HMAC hash=${PARAMETERIZED_AUTH_CREDENTIAL}`,
+    `authorization=Basic abc=${PARAMETERIZED_AUTH_CREDENTIAL}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(PARAMETERIZED_AUTH_CREDENTIAL);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
 
 test("removes an AWS SigV4 signature wherever it appears", () => {
   const cases = [
@@ -112,6 +143,49 @@ test("removes an AWS SigV4 signature wherever it appears", () => {
   expect(redactSensitiveText(`https://example.com/object?X-Amz-Signature=${SIGV4_SIGNATURE}&x=1`)).toContain("&x=1");
 });
 
+test("removes a credential from a log line truncated mid-value", () => {
+  // syslog caps a line at 1024 bytes; journald and CloudWatch truncate too. A
+  // long structured line therefore arrives with its closing quote missing, which
+  // is the NORMAL state of a big log line rather than an edge case. While the
+  // quoted alternative required its closing backreference the rule declined and
+  // a weaker rule took over, printing the marker and then the credential.
+  const cases = [
+    `{"lvl":"info","headers":{"authorization":"Basic ${BASIC_CREDENTIALS}`,
+    `{"lvl":"info","headers":{"HTTP_AUTHORIZATION":"Basic ${BASIC_CREDENTIALS}`,
+    `authorization="Basic ${BASIC_CREDENTIALS}`,
+    `authorization='Basic ${BASIC_CREDENTIALS}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(BASIC_CREDENTIALS);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
+
+test("masks the authorization value without deleting the fields beside it", () => {
+  // Over-redaction that DESTROYS an adjacent field is worse than over-masking:
+  // the value is gone from the log entirely. The scheme-consuming branch used to
+  // swallow `user=bob` here, because `denied` looks like a scheme and `user=bob`
+  // looks like the credential after it.
+  const cases = [
+    ["authorization=denied user=bob reason=scope", ["user=bob", "reason=scope"]],
+    ["authorization: denied user=bob reason=scope", ["user=bob", "reason=scope"]],
+    ["proxy_authorization=none user=alice path=/v1", ["user=alice", "path=/v1"]]
+  ] as const;
+
+  for (const [input, survivors] of cases) {
+    const redacted = redactSensitiveText(input);
+    for (const survivor of survivors) {
+      expect(redacted).toContain(survivor);
+    }
+  }
+
+  // …and the scheme-consuming branch must still work where it is genuinely a
+  // scheme, or the guard above would have been bought by reintroducing the leak.
+  expect(redactSensitiveText(`authorization=Basic ${BASIC_CREDENTIALS}`)).not.toContain(BASIC_CREDENTIALS);
+});
+
 test("positive control: the absence assertion can fail", () => {
   // If `not.toContain(BASIC_CREDENTIALS)` passed no matter what was fed in, the
   // test above would prove nothing. This anchors it: the identical literal, in
@@ -121,6 +195,10 @@ test("positive control: the absence assertion can fail", () => {
   // Same anchor for the SigV4 literal, so that test cannot pass vacuously either.
   const sigProse = `The build log mentioned ${SIGV4_SIGNATURE} in passing.`;
   expect(redactSensitiveText(sigProse)).toContain(SIGV4_SIGNATURE);
+  const digestProse = `The build log mentioned ${DIGEST_RESPONSE} in passing.`;
+  expect(redactSensitiveText(digestProse)).toContain(DIGEST_RESPONSE);
+  const parameterizedProse = `The build log mentioned ${PARAMETERIZED_AUTH_CREDENTIAL} in passing.`;
+  expect(redactSensitiveText(parameterizedProse)).toContain(PARAMETERIZED_AUTH_CREDENTIAL);
 });
 
 test("does not over-redact text that carries no credential", () => {
@@ -137,12 +215,24 @@ test("does not over-redact text that carries no credential", () => {
     // Dropping the `\b` widened what counts as a key; prose that merely contains
     // the words must still come back byte-identical.
     "signature verified for block 1234",
+    // NOTE: `SignedHeaders` contains no `signature` substring, so it cannot
+    // detect the class it looks like it is guarding. It is kept because it is a
+    // real SigV4 token, but the actual guard for `signature`-keyed masking is
+    // the assertion below, and in this repo that masking is INTENTIONAL — see
+    // docs/redaction.md. A benign case that cannot fail is not a guard.
     "SignedHeaders=host;x-amz-date"
   ] as const;
 
   for (const input of safe) {
     expect(redactSensitiveText(input)).toBe(input);
   }
+
+  // The `signature`-keyed rule masks ANY key containing `signature`, including
+  // `SignatureVersion=4`, which is not a secret. That is a deliberate trade —
+  // over-masking a non-secret is cheap, a leaked signature is not — and it is
+  // pinned here so the behaviour is a decision on record rather than a surprise.
+  // This repo and hasnaxyz/iapp-sms differ here; see docs/redaction.md.
+  expect(redactSensitiveText("SignatureVersion=4")).toBe("SignatureVersion=[REDACTED]");
 });
 
 test("strips hidden reasoning blocks", () => {
