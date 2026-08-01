@@ -82,6 +82,59 @@ Two details are load-bearing and easy to undo by accident:
    checked as well as its name, and the **first pair is never exempt**, so
    `Set-Cookie: sid=1; path=<credential>` does not walk through the exemption.
    Both properties are pinned by tests.
+5. **Those value shapes were measured too loose to be that guard, and the note
+   claiming otherwise had generalised from one fixture.** `expires` was
+   `^[A-Za-z0-9:+-]{1,32}$` — not a date check in any meaningful sense, but
+   precisely the shape of a 32-character session id — and `domain` was
+   length-unbounded and matched an 87-character JWT-shaped token; 12 of 14
+   attribute-named probes preserved a synthetic credential. `expires` now takes
+   only an RFC 1123 weekday, `domain` requires bounded labels and a **purely
+   alphabetic final label**, `max-age` an integer. A value longer than
+   `MAX_COOKIE_ATTRIBUTE_VALUE` (256) never reaches a shape test at all and is
+   masked — which fails closed *and* removes an engine-dependent backtracking
+   cliff (60× between 64 and 128 KiB on JavaScriptCore, absent on V8) that an
+   earlier "free of nested quantifiers" claim had denied existed.
+6. **Pairs are counted, not tokens.** Counting tokens let a valueless `Secure`
+   flag ahead of the cookie spend the opening-pair protection on itself, after
+   which the exemption applied to the *real* first pair and
+   `Set-Cookie: Secure; path=/<credential>` survived.
+7. **Masking preserves the structure around the value.** A trailing run of
+   serialization closers (`"`, `'`, `]`, `}`, `)`) is re-emitted rather than
+   swallowed, so a cookie logged inside JSON stays parseable —
+   `{"set-cookie": ["a=1", "sid=<tok>"]}` keeps its quotes and brackets. The
+   idempotence guard for that is deliberately *the marker followed by closers
+   only*, never `startsWith("[REDACTED]")`: the loose form would wave through a
+   value that opens with the literal marker and continues into a real
+   credential. `[REDACTED]` ends in `]`, so without the guard a second pass peels
+   the bracket and grows `[REDACTED]]` on every run.
+8. **A value that is ENTIRELY closers is still masked, and skipping it was a
+   leak.** `cookie:AUTH=",<credential>` tokenises to `AUTH="` — the comma is a
+   pair separator — so its value is the single character `"`. An early return
+   that left such a token alone put a **dangling open quote** in the line, and
+   the generic `*AUTH*` rule downstream pairs `(["'])…\2`: it mis-paired across
+   to the next field's opening quote, or declined to match, and the credential
+   printed **with no marker at all**. The same input was masked before the cookie
+   rule existed, so the rule was making that line *worse* — the misleading-output
+   class this whole file is organised around, produced by the fix rather than by
+   the gap. Found by adversarial review at 13 occurrences in a 300,000-case
+   sweep, and it was also the root of a non-fixed-point on inputs such as
+   `Set-Cookie: api_key="; session="`. **Dropping `"` and `'` from the closer set
+   closes the leak too, and was rejected on measurement**: it also gives back the
+   JSON structure the re-emission exists for (`["a=[REDACTED], "sid=[REDACTED]]}`
+   against `["a=[REDACTED]", "sid=[REDACTED]"]}`). Masking the all-closer value
+   keeps both. Measured across 214,427 distinct fuzzed strings: 0 regressions and
+   0 non-fixed-points, where the early return produced 5,745 and 9,579.
+
+**On the fuzzing that found it, because the corpus was wrong first.** The
+reviewer's original generator used `s = (s*1103515245 + 12345) & 0x7fffffff`,
+whose multiply exceeds 2^53 — precision is lost and the sequence **cycles after
+10,579 states**. Two verdicts of "300,000 cases, 0 regressions" rested on roughly
+10.5k distinct draws wearing a six-figure number: *a vacuous corpus looks
+rigorous where a vacuous control looks thin*. Re-run with `mulberry32`
+(`Math.imul`, 32-bit throughout), 300,000 draws yield **214,427 distinct
+strings** and surfaced this defect immediately. Any figure quoted from a
+generated corpus in this file should be accompanied by its **distinct-string
+count**, not its draw count.
 
 ### A probe that PASSES FOR THE WRONG REASON hides a missing mechanism
 
@@ -250,6 +303,58 @@ neither added to nor removed by this change** — 1612.0ms against 1613.4ms is
 parity, and it stays listed as an open residual below. The `cookie`-literal row
 costs 2× the base constant because a rule that did not exist now runs; the
 exponent is unchanged.
+
+#### The perf guard for that rule COULD NOT FAIL, on this file's own headline defect
+
+**The two perf assertions that shipped with the cookie rule did not test what
+their comment said, and an adversarial reviewer proved it by installing the
+rejected naive pattern and running them:** they returned **1.97, 2.00 and 1.87 —
+all green, with the ReDoS in place.**
+
+Two causes, and the first is this file's own axes lesson pointed at a perf
+harness:
+
+1. `growthPerDoubling` enlarges its input by **repeating a fixed unit**, so the
+   NUMBER of runs grows and no single unbroken run ever gets longer. The
+   quadratic is **per run**, O(run²). The harness could not express the axis the
+   defect lives on — **at any size**.
+2. `"cookiecookiecookie"` **never triggers the rule at all**: no `:` or `=`
+   follows the literal, so the outer regex never matches.
+
+The replacement grows the **run**. Measured at 8/16/32 KiB against a mutant
+carrying the naive pattern, versus the shipped forward scan:
+
+| shape | shipped scan | naive mutant | discriminates? |
+|---|---|---|---|
+| `"cookie=" + x*N` | 1.819 (0.73/1.23/2.41 ms) | **4.010** (231.6/927.1/3724.4 ms) | **yes** |
+| `"Set-Cookie: " + x*N` | 1.987 (0.62/1.19/2.45 ms) | **4.004** (231.7/941.7/3714.3 ms) | **yes** |
+| `"Cookie: sid=" + x*N` | 1.876 | 2.064 (0.1/0.1/0.2 ms) | **NO — removed** |
+
+**The third row is why the shape matters more than the size.** A first attempt at
+this test used it and it does not discriminate: `sid=` satisfies the literal
+immediately, so the scan never has to fail, and the naive pattern completes in
+0.1 ms instead of 231 ms. **The discriminating shape has no `=` in the header
+value at all.** Both shipped assertions now put the whole run after the header
+separator and before any `=`.
+
+Sizes are chosen so the failing case fails *fast* — 8/16/32 KiB rather than
+32/64/128 — because **a test that can only fail by timing out reports its budget,
+not a duration.**
+
+**The estimator takes the FASTEST sample, not the median.** CPU contention is
+strictly *additive* noise — another process can slow a sample but never speed one
+up — so on a loaded box the minimum is the sample closest to uncontended
+execution while the median drags with load. A median-based estimator failed the
+newline control at ratio **6.40** at loadavg 25, and was measured failing 2 runs
+in 10. With the fastest sample the suite ran **6 of 6 green at loadavg ~21**.
+The thing to check before changing an estimator is whether it weakens the guard,
+and it does not: a quadratic implementation has a quadratic *minimum* too — the
+naive mutant still returns **3.99995** and still fails. Verified against the
+mutant after the change rather than assumed.
+
+The original two assertions are kept and relabelled as what they genuinely pin —
+the **outer** regex's start-position cost — with the measurement that the naive
+mutant passes them written beside them.
 
 ## Not covered — known residuals
 

@@ -30,17 +30,40 @@ const DIGEST_RESPONSE_PATTERN = /(\bresponse\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\
 // treated as a cookie and masked, so the guard fails CLOSED.
 //
 // The VALUE shape is checked as well as the name, so an attribute name reused as
-// a cookie name cannot smuggle a credential past the exemption:
-// `Set-Cookie: sid=1; path=<credential>` does not look like a path and is
-// masked. Each shape is anchored and either bounded or free of nested
-// quantifiers, so none can be made to backtrack.
+// a cookie name cannot smuggle a credential past the exemption.
+//
+// THESE SHAPES WERE MEASURED TOO LOOSE TO BE THAT GUARD, and the comment that
+// stood here asserted otherwise on the strength of a single fixture. It claimed
+// `Set-Cookie: sid=1; path=<credential>` "does not look like a path and is
+// masked"; measured at that exact position, 3 of 4 credential shapes were
+// PRESERVED — it had generalised from the one shape that happened to work, which
+// is the same one-shape-passes reasoning the section on probes that pass for the
+// wrong reason in docs/redaction.md was written to warn about. `expires` was
+// `^[A-Za-z0-9:+-]{1,32}$`, which is not a date check in any meaningful sense but
+// precisely the shape of a 32-character session id; `domain` was length-unbounded
+// and matched an 87-character JWT-shaped token. 12 of 14 attribute-named probes
+// preserved a synthetic credential.
+//
+// Each shape is now narrow enough that a credential does not fit it, and each is
+// anchored at BOTH ends so there is exactly one start position. Anchoring bounds
+// the scan but not the backtracking inside one attempt — an earlier claim that
+// these were "free of nested quantifiers" was false for `domain`, which showed an
+// engine-dependent 60x cliff between 64 and 128 KiB on JavaScriptCore and none on
+// V8. MAX_COOKIE_ATTRIBUTE_VALUE removes that at the source rather than by
+// rewriting the sentence: no legitimate attribute value approaches 256 bytes (DNS
+// caps a hostname at 253), so an over-long value never reaches a shape test and
+// is masked instead. That is the fail-closed direction.
 const COOKIE_ATTRIBUTES = new Map<string, RegExp>([
   // Only the first whitespace-free run reaches here — `Expires=Wed, 09 Jun 2027`
   // arrives as the token `Expires=Wed`, and the rest of the date carries no `=`
-  // and is passed through untouched.
-  ["expires", /^[A-Za-z0-9:+-]{1,32}$/],
-  ["max-age", /^-?\d{1,20}$/],
-  ["domain", /^\.?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$/],
+  // and is passed through untouched. So a weekday IS the whole value this sees,
+  // and an ISO timestamp or a session id is masked.
+  ["expires", /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i],
+  ["max-age", /^-?\d{1,10}$/],
+  // A hostname, not "alphanumerics and dots": bounded labels, at least one dot,
+  // and a final label that is purely alphabetic. A JWT is dot-separated
+  // base64url whose last segment carries digits, so it does not fit.
+  ["domain", /^\.?[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,9}\.[A-Za-z]{2,24}$/],
   ["path", /^\/[^\s;,]{0,255}$/],
   ["samesite", /^(?:strict|lax|none)$/i],
   ["priority", /^(?:low|medium|high)$/i],
@@ -53,6 +76,10 @@ const COOKIE_ATTRIBUTES = new Map<string, RegExp>([
 ]);
 
 const LONGEST_COOKIE_ATTRIBUTE_NAME = 16;
+
+const MAX_COOKIE_ATTRIBUTE_VALUE = 256;
+
+const REDACTION_MARKER = "[REDACTED]";
 
 const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_OPENAI_KEY]"],
@@ -318,7 +345,12 @@ function isCookieSeparator(character: string): boolean {
 function redactCookiePairs(value: string, preserveAttributes: boolean): string {
   const parts: string[] = [];
   let index = 0;
-  let tokenCount = 0;
+  // COUNT PAIRS, NOT TOKENS. Counting tokens let a valueless `Secure` flag ahead
+  // of the cookie spend the opening-pair protection on itself, after which the
+  // attribute exemption applied to the REAL first pair and
+  // `Set-Cookie: Secure; path=/<credential>` survived. Found by adversarial
+  // review.
+  let pairCount = 0;
   let startsCookiePair = true;
 
   while (index < value.length) {
@@ -330,7 +362,7 @@ function redactCookiePairs(value: string, preserveAttributes: boolean): string {
     if (index > separatorStart) {
       const separator = value.slice(separatorStart, index);
       parts.push(separator);
-      if (tokenCount > 0) {
+      if (pairCount > 0) {
         startsCookiePair = separator.includes(";") || separator.includes(",");
       }
     }
@@ -345,11 +377,27 @@ function redactCookiePairs(value: string, preserveAttributes: boolean): string {
     }
 
     const token = value.slice(tokenStart, index);
-    parts.push(startsCookiePair ? maskCookiePair(token, tokenCount === 0, preserveAttributes) : token);
-    tokenCount += 1;
+    parts.push(startsCookiePair ? maskCookiePair(token, pairCount === 0, preserveAttributes) : token);
+    if (token.includes("=")) {
+      pairCount += 1;
+    }
   }
 
   return parts.join("");
+}
+
+function isStructuralCloser(character: string): boolean {
+  return character === '"' || character === "'" || character === "]" || character === "}" || character === ")";
+}
+
+function isAllStructuralClosers(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    if (!isStructuralCloser(text.charAt(index))) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 // `isFirstPair` is not a micro-optimisation. When Set-Cookie attributes are
@@ -366,15 +414,80 @@ function maskCookiePair(token: string, isFirstPair: boolean, preserveAttributes:
     return token;
   }
 
+  const rawValue = token.slice(separator + 1);
   const name = token.slice(0, separator);
-  if (preserveAttributes && !isFirstPair && name.length <= LONGEST_COOKIE_ATTRIBUTE_NAME) {
+  if (
+    preserveAttributes
+    && !isFirstPair
+    && name.length <= LONGEST_COOKIE_ATTRIBUTE_NAME
+    && rawValue.length <= MAX_COOKIE_ATTRIBUTE_VALUE
+  ) {
     const attributeShape = COOKIE_ATTRIBUTES.get(name.toLowerCase());
-    if (attributeShape?.test(token.slice(separator + 1))) {
+    if (attributeShape?.test(rawValue)) {
       return token;
     }
   }
 
-  return `${ name }=[REDACTED]`;
+  // IDEMPOTENCE, and it needs its own test rather than falling out of the
+  // masking below. `[REDACTED]` itself ENDS IN `]`, which is one of the closers
+  // stripped below — so a second pass over an already-masked pair peels that
+  // bracket off, masks the remaining `[REDACTED`, re-emits the bracket, and
+  // grows `[REDACTED]]` on every run. Every test in this file asserts
+  // `redact(redact(x)) === redact(x)`, and this is what keeps that true.
+  //
+  // The test is "the marker followed by CLOSERS ONLY", never a bare
+  // `startsWith("[REDACTED]")`, because the loose form is a bypass: a value that
+  // opens with the literal marker and continues into a real credential would be
+  // waved through. `sid=[REDACTED]<credential>` is masked; `sid=[REDACTED]"]}`
+  // is left exactly as it is.
+  if (rawValue.startsWith(REDACTION_MARKER) && isAllStructuralClosers(rawValue.slice(REDACTION_MARKER.length))) {
+    return token;
+  }
+
+  // Re-emit a trailing run of serialization closers rather than swallowing it.
+  // Replacing everything after `=` destroyed the structure around a cookie
+  // logged inside JSON — `{"set-cookie": ["a=1", "sid=<cred>"]}` came back
+  // missing its closing quotes and `"]}` — which contradicts this rule's own
+  // invariant that the output differs from the input only where a value was
+  // masked. Deleting context is a defect in its own right, not a safe direction
+  // to err in.
+  let bodyEnd = rawValue.length;
+  while (bodyEnd > 0 && isStructuralCloser(rawValue.charAt(bodyEnd - 1))) {
+    bodyEnd -= 1;
+  }
+
+  // A VALUE THAT IS ENTIRELY CLOSERS IS STILL MASKED, and returning the token
+  // untouched here was a credential leak rather than a tidy edge case.
+  //
+  // `cookie:AUTH=",<credential>` tokenises to `AUTH="` (the comma is a pair
+  // separator), whose value is the single character `"`. Leaving that token
+  // alone left a DANGLING OPEN QUOTE in the line, and the generic `*AUTH*` rule
+  // downstream pairs `(["'])…\2` — so it either mis-paired across to the next
+  // field's opening quote or declined to match at all, and the credential
+  // printed in the clear with no marker. Before this rule existed the same input
+  // was masked, so the cookie rule was making that line WORSE:
+  //
+  //   in    cookie:AUTH=",<credential>
+  //   was   cookie:AUTH=[REDACTED]
+  //   bug   cookie:AUTH=",<credential>      <- unmarked credential
+  //
+  // Found by adversarial review, 13 occurrences in a 300,000-case sweep, and it
+  // is also the root of an idempotence break on inputs such as
+  // `Set-Cookie: api_key="; session="`. Masking here restores both: measured
+  // across 214,427 distinct fuzzed strings, 0 regressions against the previous
+  // behaviour and 0 non-fixed-points, where the early return produced 5,745 and
+  // 9,579 respectively.
+  //
+  // Dropping `"` and `'` from the closer set closes the leak too, but it also
+  // gives back the JSON structure this re-emission exists for — measured, the
+  // quote-free variant returns `["a=[REDACTED], "sid=[REDACTED]]}` while this one
+  // returns `["a=[REDACTED]", "sid=[REDACTED]"]}`. Masking the all-closer value
+  // keeps both properties.
+  if (bodyEnd === 0) {
+    return `${ name }=${ REDACTION_MARKER }`;
+  }
+
+  return `${ name }=${ REDACTION_MARKER }${ rawValue.slice(bodyEnd) }`;
 }
 
 function redactParameterizedAuthorization(
