@@ -32,7 +32,9 @@ throughout — no real credential is used or rendered at any point.
 | shape | result |
 |---|---|
 | single-token `Authorization` values such as `Basic <b64>` or `Bearer <token>` (any scheme case) | redacted |
-| `Authorization: Digest ... response="<digest proof>"` | redacted |
+| `Authorization: Digest ... response="<digest proof>"` — the **plain header** form | redacted |
+| the same Digest value inside JSON — `{"authorization":"Digest ... response=\"<proof>\""}` | redacted |
+| `Hawk id="…", mac="<proof>"`, plain **and** inside JSON | redacted |
 | parameterized `Authorization` schemes such as `Scheme sig=<proof>` or `MAC mac=<proof>` | redacted |
 | `authorization=Basic <b64>` — `=` instead of `:` | redacted |
 | `authorization = Basic <b64>` — spaces around the separator | redacted |
@@ -40,7 +42,7 @@ throughout — no real credential is used or rendered at any point.
 | `proxy_authorization=` (underscore) and `proxy-authorization=` (hyphen) | redacted |
 | `X-Authorization:`, `Proxy-Authorization:` | redacted |
 | the header anywhere in a line, not only at its start | redacted |
-| `{"Authorization": "Basic <b64>"}` and nested serialized JSON | redacted |
+| `{"Authorization": "Basic <b64>"}` — a JSON **object**, one level | redacted |
 | quoted, single-quoted and `export`-prefixed spellings | redacted |
 | AWS SigV4 trailing `Signature=`, bare / in-header / in a query string | redacted |
 | `Cookie:` / `Set-Cookie:` — **every** `;`-delimited pair value, whatever the cookie is named (`session`, `sid`, `PHPSESSID`, `JSESSIONID`, `connect.sid`, `laravel_session`, `__Host-*`, `__Secure-*`) | redacted |
@@ -389,6 +391,7 @@ generators cannot express them.
 
 | shape | class | why it is still open |
 |---|---|---|
+| **headers serialized into a JSON string field** — `{"raw":"{\\"headers\\":{\\"authorization\\":\\"Basic <tok>\\"}}"}` (two `JSON.stringify` levels; pino / winston / an axios error object). Leaks for **all four** schemes. | honest gap | The escaped-quote fix (todos `d841b3e1`) closed the rung where a rule ENGAGES and terminates early. This is the rung ABOVE it: at two levels the backslash sits between `authorization` and its `:`, so the key prefix `['"]?\s*[:=]\s*` never matches and **no rule engages at all** — hence no marker. Closing it means teaching the key prefix to cross backslash escaping, which is adjacent to the normalisation-layer decision ruled a documented won't-fix in todos `4afd4361`, and was deliberately kept out of the `d841b3e1` fix so that change stayed one mechanism wide. **Measured, not assumed:** 4/4 schemes leak at two levels on `06cc7de` and on the branch that fixes one level. |
 | bare `Bearer <token>` with no `authorization` key | honest gap | The only rule that closes it — `/Bearer\s+[A-Za-z0-9._~+/=-]+/gi`, which `hasnaxyz/iapp-sms` carries — over-redacts ordinary prose: `Bearer authentication is required` becomes `Bearer [REDACTED] is required`. Closing this gap would trade a marker-free gap for a real over-redaction regression. Deliberately deferred, not overlooked. |
 | ~~`Cookie: session=<tok>`~~ | — | **CLOSED.** Covered by the cookie rule; see the covered table above. |
 | ~~`Set-Cookie: sid=<tok>; HttpOnly`~~ | — | **CLOSED.** Same rule. |
@@ -426,8 +429,34 @@ The two redactors are **not** symmetric, and assuming they are has already
 produced wrong residual lists. Measured differences at the time of writing:
 
 - `tai` leaks bare `Bearer <tok>`; `iapp-sms` does not (it has a dedicated rule).
-- `iapp-sms` had a serialized-JSON string path that `tai` never had.
+- ~~`iapp-sms` had a serialized-JSON string path that `tai` never had.~~
+  **RETRACTED — this row was read as "`tai` has no serialized-JSON exposure",
+  which is false.** `tai` leaks at the next nesting level; see the two-level row
+  in the open table above.
 - `tai` does not redact URL userinfo; `iapp-sms` does.
+- **`iapp-sms` is NOT a superset of `tai`, and must not be transplanted.**
+  Measured 2026-08-01 with a canary carrying no provider prefix: on a plain
+  `Authorization: Digest ... response="<tok>"` header, `iapp-sms` returns
+  `Authorization: [REDACTED], realm="r", … response="<tok>"` — the credential
+  surviving beside a marker — where `tai` returns `Authorization: [REDACTED]`,
+  because `tai` has a dedicated Digest rule that `iapp-sms` lacks. Across a
+  12-cell matrix (4 schemes × JSON nesting depth 0/1/2) `iapp-sms` leaked 8 cells
+  to `tai`'s 6. **Copying its mechanism wholesale would have regressed `tai`.**
+- **THE AXIS THAT MAKES THE COMPARISON LIE IS THE CANARY, NOT THE SHAPE**, and
+  it is the reason `iapp-sms` has been read as clean here more than once. Varying
+  only the canary on one fixed shape (depth-1 JSON Digest):
+
+  | canary | `iapp-sms` | `tai` (before the fix) |
+  |---|---|---|
+  | matches no prefix rule | leaks, with a marker | leaks, with a marker |
+  | `sk-…` prefixed | redacted | redacted |
+  | `sms_…` prefixed | redacted | leaks, with a marker |
+
+  A canary carrying a recognisable prefix is masked by the **provider-prefix**
+  rule, so the **structural** rule under test never runs and a broken one scores
+  clean. Both zeros are real; only the prefix-free one is evidence about the
+  mechanism. Probe redaction with a value that matches no prefix rule, or the
+  probe passes for the wrong reason.
 - **Both are quadratic, on different inputs — an earlier version of this file
   implied `tai` was not.** On a 50k single repeated character `tai` is linear
   and fast (0.6ms) while `iapp-sms` is quadratic (2.9s, `URL_USERINFO_PATTERN`).
