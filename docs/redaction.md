@@ -95,35 +95,63 @@ figures are not reproducible.** Re-measured per commit — station01, loadavg ~1
 median of 9 reps after a warmup pass at every size, reproduced in two independent
 runs:
 
-| version | auth-dense 50k | digest-shape 50k |
+| version | auth-dense 50k | digest, unterminated 50k |
 |---|---|---|
 | `main` before this change (`47de35d`) | 1420ms | 2.6ms |
 | commit 1 — truncation + adjacent-field (`9f52c8c`) | 923ms | 2.6ms |
 | commit 2 — Digest `response=` rule (`4b10ea5`) | 955ms | **65ms** |
+| commit 3 — parameterized auth rule (`6d3ae9f`) | 939ms | 60ms |
 | merged (`62f8f14`) | 939ms | **60ms** |
 
 Two effects, each attributable to one commit:
 
 * **auth-dense got ~34% FASTER**, from commit 1 onward — 0.65–0.67× `main`,
-  reproduced, and independently corroborated by two earlier measurements at
-  0.66–0.67×. Not parity.
-* **the digest shape got ~23× SLOWER**, and it starts exactly at commit 2, the
-  commit that introduces the `response=` rule. 2.6ms → 65ms at 50k.
+  reproduced, and independently corroborated by two further measurements at
+  0.66–0.67× and 0.685×. Not parity.
+* **the digest path got slower**, starting exactly at commit 2, the commit that
+  introduces the `response=` rule. **How much slower depends on the shape, and
+  the shapes differ in COMPLEXITY CLASS — see the next subsection, which is the
+  part that matters.**
 
 **The growth ratio, not the absolute figure, is what makes this checkable.** This
 section already said absolute numbers move with machine load while ratios do not
 — which is precisely why a *before/after ratio measured in one process on one
 box* is load-independent evidence, and why 0.66× cannot be explained away as
-"their host was busier". Growth stays 4.0×/doubling throughout, so the
-pre-existing quadratic is unchanged; what moved is the constant factor, in both
-directions.
+"their host was busier". On the auth-dense input growth stays 4.0×/doubling
+throughout, so that pre-existing quadratic is unchanged and only its constant
+factor moved.
 
-Note the digest regression is a **constant-factor** change, not a new quadratic:
-growth on that shape stays ~2.0×/doubling (linear) above 25k, with a reproducible
-threshold jump between 12.5k and 25k. Calling it "a new quadratic" would be a
-different and unsupported claim.
+#### The `response=` rule adds a NEW quadratic, on a shape this file first missed
 
-On bare repeated characters both are linear (~0.5ms at 50k).
+**An earlier version of this section stated flatly that the digest regression was
+"a constant-factor change, not a new quadratic", and that calling it a quadratic
+"would be a different and unsupported claim". That was measured on exactly ONE
+shape and stated without the qualifier. It is wrong as a general statement**, and
+an adversarial review caught it. Both facts below are reproduced:
+
+| shape (50k → 100k) | before `47de35d` | merged `62f8f14` | growth after |
+|---|---|---|---|
+| one header, **unterminated** `response="` + padding | 13.7 → 5.4ms | 91 → 172ms | ~1.9×/doubling — **linear** |
+| repeated `Authorization: Digest ` on **one line** | 2.0 → 4.3ms | 267 → 1060ms | **3.97×/doubling — QUADRATIC** |
+| the same content **newline-separated** | 1.9 → 3.9ms | 4.1 → 7.5ms | ~1.9×/doubling — linear |
+
+So the constant-factor finding is true **for the unterminated single-header
+shape** and is kept for that reason. It does not generalise: on repeated
+`Authorization: Digest` tokens within a single line the rule is a clean new
+quadratic, 168× at 100k against `main` and widening with n.
+
+**The newline-separated row is the control that identifies the mechanism**, not
+just the symptom. The rule's `[^\r\n]*?` between `Digest\s+` and
+`\bresponse\s*=` scans forward to end-of-**line** from every position at which
+`authorization…Digest` matches. Many matches on one line means many full-line
+rescans, which is O(n²); the identical bytes split across lines bound each rescan
+and the cost collapses back to linear. Newlines are what the pattern uses to
+stop, so a single long line is the adversarial input.
+
+On bare repeated characters every version above is linear, but the `~0.5ms at
+50k` figure that stood here does not reproduce and named no character: measured
+at 50k, `47de35d` ranges `-` 1.7ms through `a` 3.7ms, `62f8f14` ranges 1.8–2.8ms.
+The cost is character-dependent, so quote the character with the number.
 
 ## Not covered — known residuals
 
@@ -149,8 +177,10 @@ that is this file working, not this file failing.
 | `authorization.value=Basic <cred>` — `.` as a key separator | honest gap | **Live.** The trailing key run is `[A-Za-z0-9_-]*`, which excludes `.`, so the match stops at `authorization` and never reaches the `=`. |
 | `authorization%3DBasic%20<cred>` — percent-encoded | honest gap | **Live.** Nothing percent-decodes free text before matching, so no key is ever seen. |
 | a bare high-entropy value with no recognisable key or prefix | honest gap | Structural. No keyword and no prefix means nothing to key on; this cannot be closed by pattern matching. |
-| quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling on every version measured. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. The absolute cost is **not** unchanged by this change — see the performance section: auth-dense is 0.66× (faster), the digest shape ~23× (slower). A `~324ms at 50k, byte-identical` figure previously stood here and is retracted as unreproducible. |
-| digest-shape input costs ~23× more than before the `response=` rule | availability, P2 | **Live, and introduced by this change** at `4b10ea5`: a long `Authorization: Digest … response="` line goes 2.6ms → 60ms at 50k on station01. Growth stays linear (~2.0×/doubling), so this is a constant-factor regression rather than a new quadratic. Untriaged: the rule is correct and the input is adversarial-shaped, so this is a cost question, not a correctness one. |
+| quadratic growth on repeated `*AUTHORIZATION*`-shaped tokens | availability, P2 | **Live and pre-existing**, 4.0×/doubling on every version measured. Comes from the generic `[A-Z0-9_]*…[A-Z0-9_]*` key rules. Fixing it means restructuring those rules, not widening a pattern. The absolute cost is **not** unchanged by this change — see the performance section: auth-dense is 0.66× (faster). A `~324ms at 50k, byte-identical` figure previously stood here and is retracted as unreproducible. |
+| **NEW quadratic in the `response=` rule, on repeated `Authorization: Digest` within one line** | availability, **P1** | **Live, and introduced by this change** at `4b10ea5`. 2.0ms → 267ms at 50k and 4.3ms → 1060ms at 100k, **3.97×/doubling**, widening with n — a complexity-class change, not a constant factor. The same bytes newline-separated stay linear, which locates the cause in the `[^\r\n]*?` scan to end-of-line. **Reachable** — see the ReDoS row below. Tracked as `a0b7904f`; deliberately NOT fixed in the docs change that recorded it, because a documentation PR must not quietly alter redaction behaviour. |
+| digest, **unterminated** single-header shape costs ~23× more | availability, P2 | **Live, same origin** (`4b10ea5`): 2.6ms → 60ms at 50k. On *this* shape growth stays linear (~1.9×/doubling), so it is a constant-factor regression. Recorded separately from the row above because the two shapes differ in complexity class, and an earlier version of this file generalised from this one and got the other wrong. |
+| the `response=` quadratic is reachable from real call sites | **ReDoS, P1** | **Live.** `src/agentic.ts:97-98,105-106` redacts shell stdout/stderr — and `redactSensitiveText(stdout).slice(0, 12000)` truncates **after** redaction, so the 12k slice does **not** bound the regex input; the real bound is `maxBuffer: 128 * 1024`. Measured at 128KiB: **7ms → 2339ms**. `src/mcp/index.ts:107` redacts caller-supplied MCP tool text with **no maxBuffer at all**: at 512KiB, **30ms → 29058ms**. Single-threaded runtime, so this blocks the event loop. Anyone who can influence command output or call the MCP tool can spend it. |
 | Unicode or non-ASCII spellings of header names | unmeasured | Never probed. Absence of a finding here is absence of evidence, not evidence of absence. |
 | whether every runtime call site actually routes through this function | unmeasured | This file measures the function, not its callers. A correct redactor on a path nothing calls redacts nothing. |
 
