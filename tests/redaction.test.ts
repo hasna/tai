@@ -105,6 +105,84 @@ test("removes a Digest Authorization response value", () => {
   }
 });
 
+test("removes a Digest response that sits far into a long header", () => {
+  // A real Digest header reaches this length honestly: `nonce`, `opaque`,
+  // `cnonce` and a long `uri` all precede `response=`, and none is bounded by
+  // the RFC. Pinned because the ReDoS fix above had to keep working at this
+  // length rather than buying speed with a length ceiling.
+  //
+  // WHAT THIS TEST DOES NOT PROVE, stated because it was written believing the
+  // opposite: it does NOT discriminate against a bounded-scan fix. Measured —
+  // a `[^\r\n]{0,256}?` variant passes this too, because the broader
+  // Authorization rule masks the whole header downstream. So this pins an
+  // end-to-end property ("the response value never survives a long header")
+  // and is NOT a guard on the Digest rule in isolation. The evidence that the
+  // restructure changed no behaviour is the A/B corpus run in the PR body
+  // (22 shapes, zero output drift), not this assertion.
+  const longNonce = "n".repeat(2048);
+  const input = `Authorization: Digest username="synthetic-user", uri="/${ "segment/".repeat(128) }", nonce="${ longNonce }", response="${ DIGEST_RESPONSE }"`;
+
+  const redacted = redactSensitiveText(input);
+  expect(redacted).not.toContain(DIGEST_RESPONSE);
+  expect(redactSensitiveText(redacted)).toBe(redacted);
+});
+
+// The Digest rule shipped a ReDoS in 0.1.3: a lazy `[^\r\n]*?` between
+// `Digest\s+` and `response=` rescanned to end-of-line from every position where
+// `authorization...Digest` matched, which is O(n^2) on a single long line.
+//
+// These assert a GROWTH RATIO rather than a millisecond figure. An absolute
+// threshold turns machine load into a test result — this suite runs on
+// contended boxes — while the exponent does not move with load: linear stays
+// ~2x per doubling and quadratic stays ~4x whether the box is idle or busy.
+const GROWTH_SIZES_KIB = [16, 32, 64] as const;
+
+function medianMillis(input: string, runs = 5): number {
+  const samples = Array.from({ length: runs }, () => {
+    const started = process.hrtime.bigint();
+    redactSensitiveText(input);
+    return Number(process.hrtime.bigint() - started) / 1e6;
+  }).sort((a, b) => a - b);
+  return samples[Math.floor(samples.length / 2)];
+}
+
+function growthPerDoubling(unit: string, separator: string): number {
+  const times = GROWTH_SIZES_KIB.map((kib) =>
+    medianMillis(Array.from({ length: Math.floor((kib * 1024) / unit.length) }, () => unit).join(separator))
+  );
+  const ratios = times.slice(1).map((time, index) => time / times[index]);
+  return ratios.reduce((total, ratio) => total + ratio, 0) / ratios.length;
+}
+
+test("the Digest rule stays linear on a single long line", () => {
+  // Repeated `Authorization: Digest ` with no `response=` anywhere: every match
+  // starts a scan that runs to end-of-line and fails. This is the adversarial
+  // input, and it is what a caller controls at src/mcp/index.ts (no bound) and
+  // src/agentic.ts (bounded only by maxBuffer, 128 KiB — the `.slice(0, 12000)`
+  // there runs AFTER redaction and so bounds nothing).
+  const growth = growthPerDoubling("Authorization: Digest ", "");
+
+  // Measured pre-fix on station02 at loadavg 1.23: 3.94x / 3.97x / 3.99x per
+  // doubling (10.2 -> 40.1 -> 159.4 -> 635.9 ms across 16/32/64/128 KiB).
+  // Post-fix on the same box: see the paired control below. 2.8x sits clear of
+  // both a linear ~2.0x and a quadratic ~4.0x, so this fails loudly on the
+  // shipped behaviour without flaking on a loaded machine.
+  expect(growth).toBeLessThan(2.8);
+});
+
+test("newline-separated control: identical bytes, bounded rescans", () => {
+  // The PAIR is the point, not either number alone. This shape carries the same
+  // bytes as the test above with newlines between them, so each rescan is
+  // bounded by its own line and it was linear even before the fix. If a future
+  // change reintroduces end-of-line rescanning, the two diverge — the test
+  // above goes quadratic while this one stays flat — and that divergence is the
+  // signal. A single timing cannot distinguish "the regex got slow" from "the
+  // box got busy"; two shapes measured together can.
+  const growth = growthPerDoubling("Authorization: Digest ", "\n");
+
+  expect(growth).toBeLessThan(2.8);
+});
+
 test("removes key-value credential parameters from Authorization schemes", () => {
   const cases = [
     `Authorization: Scheme sig=${PARAMETERIZED_AUTH_CREDENTIAL}`,
