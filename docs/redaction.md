@@ -46,7 +46,7 @@ throughout — no real credential is used or rendered at any point.
 | `Cookie:` / `Set-Cookie:` — **every** `;`-delimited pair value, whatever the cookie is named (`session`, `sid`, `PHPSESSID`, `JSESSIONID`, `connect.sid`, `laravel_session`, `__Host-*`, `__Secure-*`) | redacted |
 | the same, in any header spelling: `set-cookie:`, `HTTP_COOKIE=`, `cookie_header:`, `cookie=`, `cookie = `, `{"cookie":"…"}`, `'…'`, and a line truncated before its closing quote | redacted |
 | a credential-bearing pair that is **not first** in the header — `Cookie: theme=dark; sid=<tok>; lang=en` | redacted |
-| an RFC 6265 attribute name reused as a cookie name — `Set-Cookie: sid=1; path=<tok>` | redacted |
+| an RFC 6265 attribute name reused as a request cookie name — `Cookie: sid=1; path=/<tok>` / `domain=<tok>.example` | redacted |
 | Set-Cookie attributes (`Path`, `Domain`, `Expires`, `Max-Age`, `SameSite`, `HttpOnly`, `Secure`, …) beside a masked cookie | preserved |
 | ordinary log fields beside a cookie header (`cookie: sid=<tok> status=200 user=bob`) | preserved |
 | a line **truncated mid-value** by a byte limit, so the closing quote is missing | redacted |
@@ -75,11 +75,11 @@ Two details are load-bearing and easy to undo by accident:
    that direction is the whole point.** Cookie names are chosen by the
    application and are unbounded, so a table of credential-bearing names fails
    OPEN on the next framework. RFC 6265 §4.1.1 fixes the *attribute* vocabulary,
-   and RFC 6265bis adds `Partitioned` — a closed set. Exempting that closed set
-   and masking everything else means an unrecognised name is treated as a cookie,
-   so the guard fails CLOSED. The attribute's **value shape** is checked as well
-   as its name, and the **first pair is never exempt** (in both header directions
-   the opening pair is the cookie itself, never an attribute), so
+   and RFC 6265bis adds `Partitioned` — a closed set. The exemption is applied
+   only in the `Set-Cookie` direction; request `Cookie` headers have no
+   attributes, so every pair is masked even when its name is `path`, `domain` or
+   another RFC attribute word. In `Set-Cookie`, the attribute's **value shape** is
+   checked as well as its name, and the **first pair is never exempt**, so
    `Set-Cookie: sid=1; path=<credential>` does not walk through the exemption.
    Both properties are pinned by tests.
 
@@ -266,7 +266,7 @@ completeness**. If you find a shape that leaks and is not here, add a row —
 that is this file working, not this file failing.
 
 **A corpus's coverage is bounded by its AXES, not its size — so name them.** The
-cookie work added a 30-shape coverage corpus and a 251-shape A/B output-drift
+cookie work added a 32-shape coverage corpus and a 251-shape A/B output-drift
 corpus (base vs this change, 0 drift, with a positive control proving the
 comparison *can* report drift). Between them they vary: cookie **name**; header
 **spelling** and **case**; **separator** (`:` / `=` / spaced); **quoting**
@@ -289,7 +289,7 @@ generators cannot express them.
 | ~~`Set-Cookie: sid=<tok>; HttpOnly`~~ | — | **CLOSED.** Same rule. |
 | a cookie pair separated from the header by **whitespace only**, `Cookie: a=1 sid=<tok>` | honest gap | **Live**, and deliberate. RFC 6265 delimits cookie pairs with `;`, so the rule masks a pair only when it opens the header or follows a `;` or `,`. Without that condition a cookie header sitting mid-line turns the rest of the line into markers — `cookie: sid=<tok> status=200 user=bob` would lose `status` and `user`, which is the adjacent-field destruction this file has already had to fix once. Browsers and servers emit `; `, so the shape is non-conformant. Measured: `Cookie: a=1 sid=<tok>` → `a=[REDACTED] sid=<tok>`. |
 | a **non-conformant cookie value containing whitespace**, `Cookie: sid=abc def` | honest gap | **Live**, same cause. `cookie-octet` excludes SP, so a value with an interior space is not a cookie value; the rule masks up to the space. Measured: `Cookie: sid=abcSYNTH defSYNTH` → `sid=[REDACTED] defSYNTH`. |
-| a credential that **happens to match an attribute's value shape**, under that attribute's name and not in first position — `Cookie: a=1; path=/<tok>` | honest gap | **Live**, and the known cost of the exemption. The attribute table checks the value's shape as well as the name, so `path=<tok>` where `<tok>` is not path-shaped **is** masked; a token that genuinely begins with `/` under the name `path` is not. Measured both directions: `Cookie: a=1; path=abcSYNTHdef` → `path=[REDACTED]`, but `Cookie: a=1; path=/abcSYNTHdef` survives. Also `domain=abcSYNTH.def`. |
+| ~~a request Cookie credential that happens to match an attribute's value shape, under that attribute's name and not in first position — `Cookie: a=1; path=/<tok>`~~ | — | **CLOSED.** Request `Cookie` headers no longer apply the `Set-Cookie` attribute exemption; `Cookie: a=1; path=/<tok>` and the domain-shaped equivalent are masked. `Set-Cookie` attributes remain preserved. |
 | **obs-fold** — a header value continued on the next line with leading whitespace | honest gap | **Live**, and shared with every other rule in this file: each value class excludes `\r\n`, so a folded continuation is never part of the match. Measured: `Cookie: a=1;\n sid=<tok>` → the continuation survives. Obsolete since RFC 7230 §3.2.4 but still produced by some proxies. |
 | URL userinfo — `scheme://user:<tok>@host` | honest gap | **Live.** `tai` has no userinfo rule at all. `hasnaxyz/iapp-sms` redacts this via `URL_USERINFO_PATTERN`; this is a genuine divergence, not a shared gap. |
 | PEM private key armour — a `-----BEGIN … PRIVATE KEY-----` block | honest gap | **Live.** No rule keys on PEM armour, and the body is bare base64 across newlines with no assignment shape to anchor on. (Written with an ellipsis on purpose so this row does not itself trip a secret scanner. Do not "fix" it back.) |

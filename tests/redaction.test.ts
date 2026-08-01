@@ -376,6 +376,8 @@ test("removes cookie values from Cookie and Set-Cookie headers", () => {
     // `Path=/` readable must not become a way to smuggle a credential past it.
     `Set-Cookie: sid=1; path=${COOKIE_CREDENTIAL}`,
     `Cookie: domain=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; path=/${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; domain=${COOKIE_CREDENTIAL}.example`,
     // AXIS: not at the start of the line, and more than one header per input.
     `req GET /v1 cookie: sid=${COOKIE_CREDENTIAL} done`,
     `Cookie: sid=${COOKIE_CREDENTIAL}\nAuthorization: Bearer ${BEARER_CREDENTIALS}`

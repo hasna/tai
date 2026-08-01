@@ -220,8 +220,8 @@ const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   // inside `HTTP_COOKIE`), no leading `[A-Za-z0-9_-]*` (a star before the literal
   // is quadratic), and the trailing key run bounded at 32 (unbounded, it rescans
   // the rest of the input from every position the literal matches). `Set-Cookie`
-  // needs no separate rule: the match simply starts at `cookie` and leaves `Set-`
-  // outside it.
+  // is captured as its own direction so RFC attributes are preserved only there;
+  // request `Cookie` headers mask every pair, including names such as `path`.
   //
   // The value is captured WHOLE — to the closing quote if quoted, with the quote
   // optional so a log line truncated at a byte limit is still covered, and
@@ -237,7 +237,7 @@ const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   // written forward scan has no backtracking to exploit, so the fix is a
   // restructure rather than a bound — the same conclusion the Digest rule above
   // reached by a different route.
-  [/(cookie[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])((?:(?!\2)[^\r\n])*)(\2?)|([^\r\n]*))/gi, redactCookieHeader],
+  [/((?:set-)?cookie[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])((?:(?!\2)[^\r\n])*)(\2?)|([^\r\n]*))/gi, redactCookieHeader],
   [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   [/((?:api|access|secret|token|password|passwd|pwd)[_-]?key?\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*['"]?\s*:\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
@@ -279,11 +279,12 @@ function redactCookieHeader(
   closingQuote: string | undefined,
   unquotedValue: string | undefined
 ): string {
+  const preserveAttributes = prefix.toLowerCase().startsWith("set-cookie");
   if (quote !== undefined) {
-    return `${ prefix }${ quote }${ redactCookiePairs(quotedValue ?? "") }${ closingQuote ?? "" }`;
+    return `${ prefix }${ quote }${ redactCookiePairs(quotedValue ?? "", preserveAttributes) }${ closingQuote ?? "" }`;
   }
 
-  return `${ prefix }${ redactCookiePairs(unquotedValue ?? "") }`;
+  return `${ prefix }${ redactCookiePairs(unquotedValue ?? "", preserveAttributes) }`;
 }
 
 function isCookieSeparator(character: string): boolean {
@@ -314,7 +315,7 @@ function isCookieSeparator(character: string): boolean {
 // comma is honoured as well so that a comma-folded header does not have its later
 // pairs swallowed into one value; a comma INSIDE a date attribute simply starts a
 // run of tokens that carry no `=` and are passed through.
-function redactCookiePairs(value: string): string {
+function redactCookiePairs(value: string, preserveAttributes: boolean): string {
   const parts: string[] = [];
   let index = 0;
   let tokenCount = 0;
@@ -344,28 +345,29 @@ function redactCookiePairs(value: string): string {
     }
 
     const token = value.slice(tokenStart, index);
-    parts.push(startsCookiePair ? maskCookiePair(token, tokenCount === 0) : token);
+    parts.push(startsCookiePair ? maskCookiePair(token, tokenCount === 0, preserveAttributes) : token);
     tokenCount += 1;
   }
 
   return parts.join("");
 }
 
-// `isFirstPair` is not a micro-optimisation. In BOTH header directions the
-// opening pair is the cookie itself and never an attribute — RFC 6265's
-// `set-cookie-string` is `cookie-pair *( ";" SP cookie-av )` — so exempting an
-// attribute NAME there would mean `Set-Cookie: path=<credential>` walks straight
-// through. An empty value is left alone: `sid=` is a deletion cookie, and
-// printing a marker where no credential existed teaches readers to discount the
-// marker.
-function maskCookiePair(token: string, isFirstPair: boolean): string {
+// `isFirstPair` is not a micro-optimisation. When Set-Cookie attributes are
+// being preserved, the opening pair is still the cookie itself and never an
+// attribute — RFC 6265's `set-cookie-string` is
+// `cookie-pair *( ";" SP cookie-av )` — so exempting an attribute NAME there
+// would mean `Set-Cookie: path=<credential>` walks straight through. Request
+// Cookie headers pass `preserveAttributes=false` and mask every pair. An empty
+// value is left alone: `sid=` is a deletion cookie, and printing a marker where
+// no credential existed teaches readers to discount the marker.
+function maskCookiePair(token: string, isFirstPair: boolean, preserveAttributes: boolean): string {
   const separator = token.indexOf("=");
   if (separator < 0 || separator === token.length - 1) {
     return token;
   }
 
   const name = token.slice(0, separator);
-  if (!isFirstPair && name.length <= LONGEST_COOKIE_ATTRIBUTE_NAME) {
+  if (preserveAttributes && !isFirstPair && name.length <= LONGEST_COOKIE_ATTRIBUTE_NAME) {
     const attributeShape = COOKIE_ATTRIBUTES.get(name.toLowerCase());
     if (attributeShape?.test(token.slice(separator + 1))) {
       return token;
