@@ -22,9 +22,27 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   //    separator instead of stopping at the key.
   //
   // The prefix is deliberately NOT matched with a leading `[A-Za-z0-9_-]*`: a
-  // star before the literal makes the scan quadratic on long inputs, and the
-  // sibling redactor in iapp-sms already has a measured 8.4s/50k quadratic that
-  // this must not reproduce here.
+  // star before the literal makes the scan quadratic on long inputs.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY, both measured on
+  // station02 with the regexes read from source rather than retyped.
+  //
+  // 1. The sibling's quadratic is URL_USERINFO_PATTERN, NOT
+  //    redactNamedAssignments. This comment used to cite iapp-sms as carrying
+  //    a measured 8.4s/50k quadratic in redactNamedAssignments. Per-pattern at
+  //    n=50000 on a single repeated character: URL_USERINFO_PATTERN 2947ms,
+  //    NAMED_ASSIGNMENT_PATTERN 0.2ms. The difference is the ANCHOR, not the
+  //    star: NAMED_ASSIGNMENT_PATTERN opens with (^|[^A-Za-z0-9_-]) so an
+  //    unbroken alnum run has one viable start position, while
+  //    URL_USERINFO_PATTERN opens with a bare [a-z] and retries everywhere.
+  //    (8.4s was station01, 2.9s is station02 — quote the box with the number.)
+  //
+  // 2. THIS FILE IS NOT EXEMPT. The trailing [A-Za-z0-9_-]* below has the same
+  //    quadratic shape as the leading star this comment declines: 470ms at 50k
+  //    on an authorization-dense run, 4.0x per doubling. It is only linear on
+  //    an input with no `authorization` substring in it. iapp-sms bounded the
+  //    identical run at 32 and restored 2.0x; that bound is NOT applied here
+  //    and the gap is recorded in docs/redaction.md rather than left implied.
   [/(authorization[A-Za-z0-9_-]*['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
   // AWS SigV4 puts the signature in a trailing `Signature=` segment of the same
   // Authorization header. The rule above eats the scheme and the first
