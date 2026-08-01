@@ -2,6 +2,34 @@
 
 All notable changes to `@hasna/tai` are documented in this file.
 
+## 0.1.5 - 2026-08-01
+
+Security release. **Every published version through 0.1.4 emits session cookies verbatim.**
+`redactSensitiveText` had no cookie handling at all, so `Cookie: session=<value>` came out
+byte-identical — and a session cookie is bearer authentication under a different header name,
+so anything logging an HTTP request through this function emitted live sessions.
+
+- **`Cookie:` and `Set-Cookie:` values are now redacted**, whatever the cookie is named.
+  The rule keys on the header's *role* — a `;`-delimited list of `name=value` pairs — rather
+  than on a list of cookie names, so `session`, `sid`, `PHPSESSID`, `JSESSIONID`,
+  `connect.sid`, `laravel_session`, `__Host-*` and `__Secure-*` are covered because none of
+  them is special. Measured against 0.1.4: 9 of 10 cookie shapes leaked.
+- **A request `Cookie:` header takes no attribute exemption.** RFC 6265 §4.2.1 makes it pairs
+  and nothing else, so `Path`, `Domain` and `Expires` there are ordinary application-chosen
+  cookie names whose values are credentials.
+- **`Set-Cookie` attribute exemptions are shape-checked and narrow.** The value shapes were
+  themselves credential-shaped — `expires` accepted any run of up to 32 alphanumerics, which
+  is precisely a 32-character session id, and `domain` was length-unbounded and matched an
+  87-character JWT. Across 8,090 generated cookie shapes, 291 leaked before this and 2 do now.
+- Set-Cookie attributes (`Path`, `Domain`, `Expires`, `Max-Age`, `SameSite`, `HttpOnly`,
+  `Secure`) and whitespace-separated neighbouring log fields stay readable; a cookie logged
+  inside JSON keeps its surrounding quotes and brackets.
+
+**Known residuals are named rather than implied** — see `docs/redaction.md`: percent-encoded
+and Unicode spellings of the header name, folded continuation lines, whitespace-separated
+pairs carrying no semicolon, and a genuinely path- or hostname-shaped value in a `Set-Cookie`
+`Path=`/`Domain=` slot.
+
 ## 0.1.3 - 2026-08-01
 
 Security release. `redactSensitiveText` printed its `[REDACTED]` marker while leaving the
