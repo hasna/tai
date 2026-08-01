@@ -719,3 +719,165 @@ test("a cookie value that is entirely delimiters is still masked", () => {
   // Positive control: the literal is findable when nothing masks it.
   expect(redactSensitiveText(`log mentioned ${COOKIE_CREDENTIAL} once`)).toContain(COOKIE_CREDENTIAL);
 });
+
+// ---------------------------------------------------------------------------
+// ESCAPED-QUOTE TERMINATOR — todos d841b3e1.
+//
+// THIS AXIS DID NOT EXIST IN THIS FILE BEFORE THIS COMMIT, which is why a suite
+// carrying 21 `digest` fixtures never found the defect. Measured on the corpus
+// at 06cc7de: escaped quotes 0 occurrences, `hawk` 0 occurrences — so no amount
+// of adding cases along the EXISTING axes could have expressed the shape. The
+// tests below introduce the axis rather than extending the list.
+
+// Synthetic, never-issued. Deliberately matches NO provider-prefix rule in
+// src/redaction.ts (not sk-, gsk_, csk-, AKIA) so that a pass here can only come
+// from the structural authorization handling under test.
+//
+// THAT PROPERTY IS THE POINT AND IT IS EASY TO LOSE. Probing this same defect
+// with an `sk-`-prefixed canary returns "redacted" from the provider-prefix rule
+// while the structural rule is still broken — the probe passes for the wrong
+// reason. That is exactly how a sibling implementation was read as clean on
+// shapes it in fact leaks on.
+const ESCAPED_QUOTE_CANARY = "QQZZSYNTHETICCANARY0000NOTACREDENTIAL9999";
+
+const AUTHORIZATION_SCHEMES = [
+  ["Basic", `Basic ${ ESCAPED_QUOTE_CANARY }`],
+  ["Bearer", `Bearer ${ ESCAPED_QUOTE_CANARY }`],
+  // RFC 7616 Digest and Hawk carry QUOTED PARAMETERS natively. That is the whole
+  // reachability argument: one ordinary `JSON.stringify(req.headers)` already
+  // produces the escaped-quote shape for them, with no double encoding and no
+  // attacker shaping the input.
+  ["Digest", `Digest username="u", realm="r", nonce="n", uri="/", qop=auth, response="${ ESCAPED_QUOTE_CANARY }", opaque="o"`],
+  ["Hawk", `Hawk id="dh37fgj492je", ts="1353832234", nonce="j4h3g2", ext="x", mac="${ ESCAPED_QUOTE_CANARY }"`]
+] as const;
+
+test("a JSON-serialized headers object does not leak the credential past an escaped quote", () => {
+  for (const [scheme, value] of AUTHORIZATION_SCHEMES) {
+    // The ordinary log call: JSON.stringify(req.headers). Built with a real
+    // serializer, not hand-written, so the escaping is the runtime's.
+    const input = JSON.stringify({ headers: { authorization: value } });
+    const redacted = redactSensitiveText(input);
+
+    expect(redacted, `${ scheme } leaked through a JSON-serialized headers object`)
+      .not.toContain(ESCAPED_QUOTE_CANARY);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
+
+test("the marker never appears beside a surviving credential", () => {
+  // The specific pathology this task exists to remove, asserted directly rather
+  // than as a consequence: before the fix the Digest and Hawk rows above came
+  // back as `"authorization":"[REDACTED]"u\", response=\"<cred>\""` — a marker
+  // that tells the next reader the line is clean, next to the credential. A
+  // plain gap is bad; a gap wearing a marker is worse, because it stops the
+  // reader looking.
+  for (const [scheme, value] of AUTHORIZATION_SCHEMES) {
+    const redacted = redactSensitiveText(JSON.stringify({ headers: { authorization: value } }));
+    const leaked = redacted.includes(ESCAPED_QUOTE_CANARY);
+    expect(leaked && redacted.includes("[REDACTED]"), `${ scheme } printed a marker beside a surviving credential`)
+      .toBe(false);
+  }
+});
+
+test("escaped-quote coverage does not depend on the credential matching a provider prefix", () => {
+  // POSITIVE CONTROL FOR THE CONTROL. If this canary ever starts matching a
+  // provider-prefix rule, every assertion above would pass without the
+  // structural rule working at all. Pin the property: in bare prose, where no
+  // structural rule applies, the canary must survive.
+  expect(redactSensitiveText(`build id ${ ESCAPED_QUOTE_CANARY } is public`))
+    .toContain(ESCAPED_QUOTE_CANARY);
+});
+
+test("escaped quotes in ordinary non-credential JSON are preserved byte for byte", () => {
+  // NEGATIVE CONTROL. A change that masks everything scores zero leaks and is a
+  // different defect. Legitimate structure carrying escaped quotes must come
+  // back unchanged.
+  for (const safe of [
+    String.raw`{"user":"bob","note":"he said \"hello\" loudly"}`,
+    String.raw`{"path":"C:\\Users\\bob","ok":true}`,
+    String.raw`{"msg":"quote \" inside","level":"info"}`
+  ]) {
+    expect(redactSensitiveText(safe)).toBe(safe);
+  }
+
+  // The neighbouring-field guard, asserted as the file's own design states it
+  // rather than as "byte-identical". An explicit non-secret status IS masked —
+  // `authorization=denied` becomes `authorization=[REDACTED]` — while the audit
+  // fields beside it survive. Over-redaction that DELETES a neighbour is the
+  // failure this protects against, and this file has had to fix it once.
+  //
+  // Written down because the first version of this test asserted byte-identity
+  // and failed: measured on both base and patched, the outputs are IDENTICAL, so
+  // the test was wrong about the design and the code was right. Pinning the
+  // wrong property here would have made a future correct change look like a
+  // regression.
+  for (const [input, survivors] of [
+    [`authorization=denied user=bob reason=scope`, ["user=bob", "reason=scope"]],
+    [`authorization=allowed user=alice`, ["user=alice"]]
+  ] as const) {
+    const redacted = redactSensitiveText(input);
+    for (const survivor of survivors) {
+      expect(redacted, `over-redaction deleted a neighbouring audit field: ${ survivor }`).toContain(survivor);
+    }
+  }
+});
+
+test("the escape-aware value body cannot be driven exponential by a run of backslashes", () => {
+  // THE OBVIOUS FIX IS A ReDoS AND THIS IS WHAT PINS THE SHIPPED ONE.
+  //
+  // `(?:\\.|(?!\2)[^\r\n])*` lets a backslash be consumed by EITHER branch, so a
+  // run of N backslashes has exponentially many parses. They are only explored
+  // when the quoted branch must FAIL — which is precisely the generic key rules,
+  // whose closing quote is required (`\2`, not `\2?`).
+  //
+  // Measured on this box against a mutant carrying the ambiguous body:
+  // 0.25 / 0.57 / 1.54 / 3.96 / 10.35 / 27.33 ms at N = 18/20/22/24/26/28,
+  // roughly 1.6^N, while the shipped disjoint body stayed flat at ~0.001 ms.
+  // This file has already shipped two quadratic rules; a third arriving through
+  // the fix for a leak would be a poor trade.
+  //
+  // The assertion is an absolute budget rather than a growth ratio because the
+  // exponential separates by orders of magnitude, not by a slope — and because
+  // the ratio-based tests in this file are the source of every flake in it.
+  const adversarial = (n: number) => `API_TOKEN:"` + "\\".repeat(n) + "\nX";
+
+  // Calibration guard: prove the input actually reaches the rule, so a budget
+  // met by an input the regex never touches cannot pass for coverage.
+  expect(redactSensitiveText(`API_TOKEN:"${ ESCAPED_QUOTE_CANARY }"`)).not.toContain(ESCAPED_QUOTE_CANARY);
+
+  const started = process.hrtime.bigint();
+  for (const n of [24, 28, 32, 40, 64, 128]) {
+    redactSensitiveText(adversarial(n));
+  }
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  // The ambiguous body needs ~27 ms for N=28 ALONE and doubles every two
+  // backslashes, so it cannot complete N=40 let alone N=128 inside this budget.
+  // The disjoint body completes the whole sweep in well under a millisecond.
+  expect(elapsedMs).toBeLessThan(1000);
+});
+
+test("every rule that models a quoted value captures the quote as group 2", () => {
+  // The shared value body carries `\2`, so it is only correct while the opening
+  // quote is group 2 in every pattern that embeds it. That invariant is
+  // currently true by construction and would break silently — the rule would
+  // simply stop matching, and a redaction rule that stops matching fails OPEN.
+  // Asserted here rather than left to be discovered by a leak.
+  const quoted = [
+    `{"headers":{"authorization":"Basic ${ ESCAPED_QUOTE_CANARY }"}}`,
+    `{"signature":"${ ESCAPED_QUOTE_CANARY }"}`,
+    `{"API_TOKEN":"${ ESCAPED_QUOTE_CANARY }"}`,
+    `{"api_key":"${ ESCAPED_QUOTE_CANARY }"}`,
+    `API_TOKEN="${ ESCAPED_QUOTE_CANARY }"`,
+    `api_key="${ ESCAPED_QUOTE_CANARY }"`,
+    `{"cookie":"sid=${ ESCAPED_QUOTE_CANARY }"}`
+  ];
+
+  for (const input of quoted) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted, `group-2 invariant broken for: ${ input }`).not.toContain(ESCAPED_QUOTE_CANARY);
+    // The surrounding quote must be re-emitted, not swallowed — a rule that
+    // matched but dropped the quote would also pass the leak assertion.
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});

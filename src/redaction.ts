@@ -15,10 +15,54 @@ const NON_SECRET_AUTHORIZATION_VALUES = new Set([
 
 const AUTHORIZATION_PARAMETER_PATTERN = /(?:^|[\s,])[A-Za-z_][A-Za-z0-9_.-]{0,32}=(?!=)(?=\S)/;
 
+// THE BODY OF A QUOTED VALUE — the single source of truth for every rule in
+// this file that models one. It is a shared constant rather than eight copies
+// because the defect it fixes was eight identical copies of a quoting model
+// that did not understand escaping, and a fix applied to the copies an author
+// happened to be looking at is how this file has already grown four
+// list-shaped guards.
+//
+// THE DEFECT (todos d841b3e1): the previous body was `(?:(?!\2)[^\r\n])*`,
+// which stops at the first quote CHARACTER regardless of whether a backslash
+// escapes it. `JSON.stringify(req.headers)` — an ordinary log call, no
+// attacker, no double encoding — emits
+//
+//   {"headers":{"authorization":"Digest username=\"u\", response=\"<cred>\""}}
+//
+// and RFC 7616 Digest and Hawk carry QUOTED PARAMETERS natively, so that shape
+// arrives from one plain serialization. The old body opened at the value's
+// quote, ran into `username=\` and terminated on the escaped quote, so the rule
+// masked the four characters before it and emitted
+// `"authorization":"[REDACTED]"u\", response=\"<cred>\""` — the credential
+// surviving BESIDE a marker that says it was handled, which is worse than no
+// rule at all because the next reader greps for the marker and stops.
+//
+// THE TWO BRANCHES ARE DISJOINT ON THEIR FIRST CHARACTER, and that is
+// load-bearing rather than stylistic. The obvious escape-aware form is
+// `(?:\\.|(?!\2)[^\r\n])*`, where a backslash can be consumed EITHER as the
+// head of an escape pair OR as an ordinary character — an ambiguity that gives
+// the engine exponentially many ways to partition a run of backslashes and
+// makes the rule a ReDoS on a failing suffix. This file has shipped two
+// quadratic rules already, so excluding `\` from the single-character branch is
+// not defensive styling: it makes the alternation deterministic, so a run of
+// backslashes has exactly one parse and the scan stays linear by construction.
+//
+// A lone trailing backslash matches NEITHER branch, so the loop simply ends and
+// the optional closing quote is left to the caller's `\2?`. That is the same
+// truncation tolerance the rules already had.
+//
+// Every caller captures the opening quote as group 2, which is what lets one
+// fragment carry `\2`. That invariant is asserted by a test rather than left to
+// be noticed when it breaks.
+const QUOTED_VALUE_BODY = String.raw`(?:\\[^\r\n]|(?!\2)[^\\\r\n])*`;
+
 // Applied to ONE Digest header value at a time by redactDigestResponse, never
 // to the whole input. Scoping it that way is what keeps the scan linear — see
 // the note above the Digest entry in SECRET_PATTERNS.
-const DIGEST_RESPONSE_PATTERN = /(\bresponse\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|[^\s'",]+)/gi;
+const DIGEST_RESPONSE_PATTERN = new RegExp(
+  String.raw`(\bresponse\s*=\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2?|[^\s'",]+)`,
+  "gi"
+);
 
 // RFC 6265 fixes the Set-Cookie attribute vocabulary (§4.1.1), and RFC 6265bis
 // adds `Partitioned`. That the vocabulary is CLOSED is the whole reason an
@@ -213,7 +257,7 @@ const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   // input from every position the literal matches, which is quadratic on a line
   // full of repeated `HTTP_AUTHORIZATION_` tokens. A real key suffix is `_header`
   // or similar, so 32 costs nothing and keeps the scan linear.
-  [/(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|(?:[A-Za-z][A-Za-z0-9._-]*\s+(?![^\s'"]*=[^\s'"=]))?[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
+  [new RegExp(String.raw`(authorization[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2?|(?:[A-Za-z][A-Za-z0-9._-]*\s+(?![^\s'"]*=[^\s'"=]))?[^\s'"]+)`, "gi"), "$1$2[REDACTED]$2"],
   // AWS SigV4 puts the signature in a trailing `Signature=` segment of the same
   // Authorization header. The rule above eats the scheme and the first
   // comma-delimited part, so without this the header came out as
@@ -222,7 +266,7 @@ const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   // misleading shape this file exists to remove rather than a mere gap.
   // The value class stops at `&`, `,` and `;` so that redacting a signature in a
   // query string does not swallow the unrelated parameters after it.
-  [/(signature[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2?|[^\s'"&,;]+)/gi, "$1$2[REDACTED]$2"],
+  [new RegExp(String.raw`(signature[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2?|[^\s'"&,;]+)`, "gi"), "$1$2[REDACTED]$2"],
   // A `Cookie:` / `Set-Cookie:` value is a THIRD delimiter role, after the
   // single-token scheme value and the comma-separated Digest parameter list: the
   // header value is itself a `;`-delimited list of `name=value` pairs, and the
@@ -264,11 +308,11 @@ const SECRET_PATTERNS: Array<[RegExp, SecretReplacement]> = [
   // written forward scan has no backtracking to exploit, so the fix is a
   // restructure rather than a bound — the same conclusion the Digest rule above
   // reached by a different route.
-  [/((?:set-)?cookie[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])((?:(?!\2)[^\r\n])*)(\2?)|([^\r\n]*))/gi, redactCookieHeader],
-  [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
-  [/((?:api|access|secret|token|password|passwd|pwd)[_-]?key?\s*=\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
-  [/(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*['"]?\s*:\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"],
-  [/((?:api|access|secret|token|password|passwd|pwd)[_-]?key?['"]?\s*:\s*)(?:(["'])(?:(?!\2)[^\r\n])*\2|[^\s'"]+)/gi, "$1$2[REDACTED]$2"]
+  [new RegExp(String.raw`((?:set-)?cookie[A-Za-z0-9_-]{0,32}['"]?\s*[:=]\s*)(?:(["'])(${ QUOTED_VALUE_BODY })(\2?)|([^\r\n]*))`, "gi"), redactCookieHeader],
+  [new RegExp(String.raw`(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*\s*=\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2|[^\s'"]+)`, "gi"), "$1$2[REDACTED]$2"],
+  [new RegExp(String.raw`((?:api|access|secret|token|password|passwd|pwd)[_-]?key?\s*=\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2|[^\s'"]+)`, "gi"), "$1$2[REDACTED]$2"],
+  [new RegExp(String.raw`(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*['"]?\s*:\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2|[^\s'"]+)`, "gi"), "$1$2[REDACTED]$2"],
+  [new RegExp(String.raw`((?:api|access|secret|token|password|passwd|pwd)[_-]?key?['"]?\s*:\s*)(?:(["'])${ QUOTED_VALUE_BODY }\2|[^\s'"]+)`, "gi"), "$1$2[REDACTED]$2"]
 ];
 
 export function redactSensitiveText(value: string): string {
