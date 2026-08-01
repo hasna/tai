@@ -46,9 +46,13 @@ throughout — no real credential is used or rendered at any point.
 | `Cookie:` / `Set-Cookie:` — **every** `;`-delimited pair value, whatever the cookie is named (`session`, `sid`, `PHPSESSID`, `JSESSIONID`, `connect.sid`, `laravel_session`, `__Host-*`, `__Secure-*`) | redacted |
 | the same, in any header spelling: `set-cookie:`, `HTTP_COOKIE=`, `cookie_header:`, `cookie=`, `cookie = `, `{"cookie":"…"}`, `'…'`, and a line truncated before its closing quote | redacted |
 | a credential-bearing pair that is **not first** in the header — `Cookie: theme=dark; sid=<tok>; lang=en` | redacted |
+| **every** pair of a REQUEST `Cookie:` header, including ones named `path`, `domain`, `expires`, `max-age`, `samesite` — a request header has no attributes | redacted |
 | an RFC 6265 attribute name reused as a cookie name — `Set-Cookie: sid=1; path=<tok>` | redacted |
-| Set-Cookie attributes (`Path`, `Domain`, `Expires`, `Max-Age`, `SameSite`, `HttpOnly`, `Secure`, …) beside a masked cookie | preserved |
-| ordinary log fields beside a cookie header (`cookie: sid=<tok> status=200 user=bob`) | preserved |
+| an attribute-named pair whose value does not fit that attribute's shape — `Set-Cookie: sid=1; Expires=<32-char id>`, `Domain=<JWT>` | redacted |
+| an attribute name in FIRST position, or after a valueless flag — `Set-Cookie: Secure; path=<tok>` | redacted |
+| Set-Cookie attributes (`Path`, `Domain`, `Expires`, `Max-Age`, `SameSite`, `Priority`, `HttpOnly`, `Secure`, …) beside a masked cookie | preserved |
+| ordinary **whitespace-separated** log fields beside a cookie header (`cookie: sid=<tok> status=200 user=bob`) | preserved |
+| the structure around a cookie logged inside JSON — `{"set-cookie": ["a=1", "sid=<tok>"]}` keeps its quotes and brackets | preserved |
 | a line **truncated mid-value** by a byte limit, so the closing quote is missing | redacted |
 | the value masked **without deleting the fields beside it** (`authorization=denied user=bob` keeps `user=bob`) | preserved |
 | `sk-`, `gsk_`, `csk-`, `AKIA…` provider keys | redacted |
@@ -77,11 +81,36 @@ Two details are load-bearing and easy to undo by accident:
    OPEN on the next framework. RFC 6265 §4.1.1 fixes the *attribute* vocabulary,
    and RFC 6265bis adds `Partitioned` — a closed set. Exempting that closed set
    and masking everything else means an unrecognised name is treated as a cookie,
-   so the guard fails CLOSED. The attribute's **value shape** is checked as well
-   as its name, and the **first pair is never exempt** (in both header directions
-   the opening pair is the cookie itself, never an attribute), so
-   `Set-Cookie: sid=1; path=<credential>` does not walk through the exemption.
-   Both properties are pinned by tests.
+   so the guard fails CLOSED.
+5. **The exemption applies to `Set-Cookie` ONLY, and never to the opening pair.**
+   A request `Cookie:` header is `cookie-pair *( ";" SP cookie-pair )` — pairs and
+   nothing else (RFC 6265 §4.2.1). `Path`, `Domain`, `Expires` and the rest are
+   *response* attributes with no meaning in a request, so there they are ordinary
+   application-chosen cookie NAMES and their values are credentials. The first
+   version of this rule could not tell the two headers apart, because it starts
+   matching at the `cookie` substring, and an adversarial review measured the
+   consequence: `Cookie: sid=1; path=/<credential>` and
+   `Cookie: sid=1; domain=<credential>.example` both survived. The optional
+   `set[-_]?` capture at the head of the match is what distinguishes them.
+   Likewise the opening pair is never exempt — in both directions it is the
+   cookie itself — and **pairs are counted rather than tokens**, so a valueless
+   `Secure` ahead of the cookie cannot spend that protection.
+6. **The attribute value SHAPES are a second guard and were measured too loose.**
+   `expires` accepted any run of up to 32 alphanumerics — which is precisely the
+   shape of a session id, not a date check in any meaningful sense — and `domain`
+   was length-unbounded and accepted an 87-character JWT-shaped token; 12 of 14
+   attribute-named probes preserved a synthetic credential. They are now narrow
+   enough that a credential does not fit: `expires` takes only an RFC 1123
+   weekday, `domain` requires bounded labels and a purely alphabetic final label,
+   `max-age` an integer. A value longer than `MAX_COOKIE_ATTRIBUTE_VALUE` (256)
+   never reaches a shape test at all and is masked — which both fails closed and
+   removes an engine-dependent backtracking cliff measured on JavaScriptCore.
+7. **Masking preserves the structure around the value.** A trailing run of
+   serialization closers (`"`, `'`, `]`, `}`, `)`) is re-emitted rather than
+   swallowed, so a cookie logged inside JSON stays parseable. The idempotence
+   guard for that is deliberately "the marker followed by closers ONLY", never
+   `startsWith("[REDACTED]")` — the loose form would wave through a value that
+   opens with the literal marker and continues into a real credential.
 
 ### A probe that PASSES FOR THE WRONG REASON hides a missing mechanism
 
@@ -251,6 +280,34 @@ parity, and it stays listed as an open residual below. The `cookie`-literal row
 costs 2× the base constant because a rule that did not exist now runs; the
 exponent is unchanged.
 
+##### The first version of that guard could not fail, on this file's own headline defect
+
+**The two perf assertions originally shipped with this rule did not test what
+their comment said they tested, and an adversarial reviewer proved it by
+installing the rejected naive pattern and running them:** they returned 1.97,
+2.00 and 1.87 and all passed **with the ReDoS in place**.
+
+Two causes, and the first is this file's own axes lesson:
+
+1. `growthPerDoubling` enlarges its input by **repeating a fixed unit**, so the
+   number of runs grows and no single run ever gets longer. The quadratic is
+   **per run**, O(run²). The harness could not express the axis the defect lives
+   on — at any size.
+2. `"cookiecookiecookie"` **never triggers the rule at all**: no `:` or `=`
+   follows the literal, so the outer regex never matches.
+
+The replacement grows the **run**, which is the axis: `"cookie=" + "x".repeat(N)`.
+Measured at 8/16/32 KiB, the naive pattern gives **3.998× per doubling and fails
+the assertion in 28.8s**, while the shipped forward scan gives ~1.9× and passes.
+Both outcomes were exercised; neither is asserted. Sizes are chosen so the
+failing case fails *fast* — **a test that can only fail by timing out reports its
+budget, not a duration.**
+
+The original two assertions are kept and relabelled as what they genuinely pin —
+the **outer** regex's start-position cost — with the measurement that the naive
+mutant passes them written beside them, so nobody mistakes them for a guard on
+the inner scan.
+
 ## Not covered — known residuals
 
 **Known leaking shapes measured at `127ffc4` on 2026-07-31 (UTC), station02.
@@ -289,7 +346,8 @@ generators cannot express them.
 | ~~`Set-Cookie: sid=<tok>; HttpOnly`~~ | — | **CLOSED.** Same rule. |
 | a cookie pair separated from the header by **whitespace only**, `Cookie: a=1 sid=<tok>` | honest gap | **Live**, and deliberate. RFC 6265 delimits cookie pairs with `;`, so the rule masks a pair only when it opens the header or follows a `;` or `,`. Without that condition a cookie header sitting mid-line turns the rest of the line into markers — `cookie: sid=<tok> status=200 user=bob` would lose `status` and `user`, which is the adjacent-field destruction this file has already had to fix once. Browsers and servers emit `; `, so the shape is non-conformant. Measured: `Cookie: a=1 sid=<tok>` → `a=[REDACTED] sid=<tok>`. |
 | a **non-conformant cookie value containing whitespace**, `Cookie: sid=abc def` | honest gap | **Live**, same cause. `cookie-octet` excludes SP, so a value with an interior space is not a cookie value; the rule masks up to the space. Measured: `Cookie: sid=abcSYNTH defSYNTH` → `sid=[REDACTED] defSYNTH`. |
-| a credential that **happens to match an attribute's value shape**, under that attribute's name and not in first position — `Cookie: a=1; path=/<tok>` | honest gap | **Live**, and the known cost of the exemption. The attribute table checks the value's shape as well as the name, so `path=<tok>` where `<tok>` is not path-shaped **is** masked; a token that genuinely begins with `/` under the name `path` is not. Measured both directions: `Cookie: a=1; path=abcSYNTHdef` → `path=[REDACTED]`, but `Cookie: a=1; path=/abcSYNTHdef` survives. Also `domain=abcSYNTH.def`. |
+| a credential in a **`Set-Cookie`** `Path=` slot that is genuinely path-shaped — `Set-Cookie: sid=1; Path=/<tok>` | honest gap | **Live**, and the remaining cost of the exemption. In a response header that slot *is* the Path attribute, and a path is not a secret, so it is preserved. Narrowed twice since the first version: it no longer applies to **request** `Cookie:` headers at all (where it was the P1 defect), nor to the opening pair, nor to `Expires`/`Domain`/`Max-Age` values that do not fit a weekday / hostname / integer. Measured both directions: `Set-Cookie: sid=1; path=abcSYNTHdef` → `path=[REDACTED]`; `Set-Cookie: sid=1; Path=/abcSYNTHdef` survives. |
+| a `;`- or `,`-delimited **non-cookie** `key=value` field inside a cookie header's span | over-masking, P3 | **Live and deliberate.** Measured by adversarial review: 34 of 58 fields masked across 22 lines, with **0 deleted** and the name surviving in 22 of 22 — so context is degraded, never destroyed. A line such as `cookieCount=17, remote=10.0.0.7` loses the address. It fails closed, which is the direction to err in for a redactor, and the alternative is guessing which `;`-delimited pair in a cookie header is a cookie. Note the scope of the "preserved" row in the covered table above: it is tested for **whitespace**-separated neighbours, and `;`/`,`-delimited ones are masked. |
 | **obs-fold** — a header value continued on the next line with leading whitespace | honest gap | **Live**, and shared with every other rule in this file: each value class excludes `\r\n`, so a folded continuation is never part of the match. Measured: `Cookie: a=1;\n sid=<tok>` → the continuation survives. Obsolete since RFC 7230 §3.2.4 but still produced by some proxies. |
 | URL userinfo — `scheme://user:<tok>@host` | honest gap | **Live.** `tai` has no userinfo rule at all. `hasnaxyz/iapp-sms` redacts this via `URL_USERINFO_PATTERN`; this is a genuine divergence, not a shared gap. |
 | PEM private key armour — a `-----BEGIN … PRIVATE KEY-----` block | honest gap | **Live.** No rule keys on PEM armour, and the body is bare base64 across newlines with no assignment shape to anchor on. (Written with an ellipsis on purpose so this row does not itself trip a secret scanner. Do not "fix" it back.) |

@@ -137,7 +137,12 @@ test("removes a Digest response that sits far into a long header", () => {
 // ~2x per doubling and quadratic stays ~4x whether the box is idle or busy.
 const GROWTH_SIZES_KIB = [16, 32, 64] as const;
 
-function medianMillis(input: string, runs = 5): number {
+function medianMillis(input: string, runs = 9): number {
+  // Warm up before sampling. Without it the first sample carries JIT compilation
+  // and shows up as a ratio outlier on a loaded box — measured flaking 1 run in
+  // 15 in-process against the 2.8 threshold. The threshold is sound; the
+  // estimator was the weak part.
+  redactSensitiveText(input);
   const samples = Array.from({ length: runs }, () => {
     const started = process.hrtime.bigint();
     redactSensitiveText(input);
@@ -435,17 +440,62 @@ test("keeps Set-Cookie attributes and neighbouring log fields readable", () => {
   }
 });
 
+// GROWS THE RUN, NOT THE REPEAT COUNT — and that distinction is the whole test.
+//
+// `growthPerDoubling` above enlarges its input by repeating a fixed unit, so no
+// single unbroken run ever gets longer. The quadratic this rule was restructured
+// to avoid is PER RUN, O(run²): `[^\s;,=]+` followed by a literal `=` backtracks
+// across one run at every start position inside it. A harness that never grows a
+// run cannot express that axis AT ANY SIZE.
+//
+// Measured by an adversarial reviewer, who installed the rejected naive pattern
+// and ran the two assertions below it: they returned 1.97, 2.00 and 1.87 — all
+// green, with the ReDoS in place. On THIS shape the same mutant returns 4.00
+// (3.59 / 14.30 / 57.14 / 228.71 / 914.27 / 3652.03 ms at 1–32 KiB) against ~2.0
+// for the shipped forward scan: 1675× at 32 KiB.
+//
+// Sizes are chosen so BOTH outcomes are cheap to observe. At 8/16/32 KiB the
+// linear scan lands around 0.6/1.1/2.2 ms — above timer noise — while the
+// quadratic lands around 229/914/3652 ms, so a reintroduced ReDoS fails this
+// assertion inside a minute instead of hanging the suite. A test that can only
+// fail by timing out reports its BUDGET, not a duration, and is worth less.
+const RUN_GROWTH_SIZES_KIB = [8, 16, 32] as const;
+
+function runLengthGrowthPerDoubling(prefix: string): number {
+  const times = RUN_GROWTH_SIZES_KIB.map((kib) =>
+    medianMillis(prefix + "x".repeat(kib * 1024 - prefix.length), 5)
+  );
+  const ratios = times.slice(1).map((time, index) => time / times[index]);
+  return ratios.reduce((total, ratio) => total + ratio, 0) / ratios.length;
+}
+
+test("the cookie rule stays linear as a single unbroken RUN grows", () => {
+  // One cookie header whose value is one enormous token with no delimiter — the
+  // exact axis the repeat-based harness cannot reach.
+  expect(runLengthGrowthPerDoubling("cookie=")).toBeLessThan(2.8);
+  // Same axis with the pair separator present but never satisfied, so the scan
+  // is forced through the whole run.
+  expect(runLengthGrowthPerDoubling("Cookie: sid=")).toBeLessThan(2.8);
+});
+
 test("the cookie rule stays linear on a cookie-dense single line", () => {
-  // Same instrument as the Digest pair above: a GROWTH RATIO, not a millisecond
-  // figure, because the exponent does not move with machine load. The naive
-  // inner pattern for this rule — /([^\s;,=]+)=([^\s;,]*)/g — was measured at
-  // 3.98x/3.99x/4.00x per doubling on a long run carrying no `=` at all, which
-  // is why the implementation scans linearly instead of matching pairs.
+  // WHAT THESE TWO ACTUALLY GUARD, stated accurately because the first version
+  // of this comment claimed they guarded the inner scan and they do not.
+  // Repeating a fixed unit grows the NUMBER of runs, not their LENGTH, so these
+  // exercise the OUTER regex — how many start positions it must consider, and
+  // whether a match consumes to end-of-line instead of being re-entered. That is
+  // a real property worth pinning. It is not the per-run quadratic, which is
+  // pinned by the run-length test above.
   //
-  // This is the adversarial shape for that pattern: header keys with no
-  // separator, so every start position that matches the literal must scan and
-  // fail.
+  // Kept honest by measurement: with the rejected naive inner pattern installed,
+  // both of these return ~2.0 and PASS. Neither can detect that defect.
   expect(growthPerDoubling("Cookie: sid=a; b=c; ", "")).toBeLessThan(2.8);
+  // NOTE: this one never triggers the cookie rule at all — no `:` or `=` follows
+  // the literal, so the outer regex never matches and the input is returned
+  // unchanged. It is retained as a guard on the LITERAL-SCAN cost of adding a
+  // second `cookie`-keyed pattern to a file full of them, and it is labelled so
+  // nobody reads it as cookie-redaction coverage.
+  expect(redactSensitiveText("cookiecookiecookie")).toBe("cookiecookiecookie");
   expect(growthPerDoubling("cookiecookiecookie", "")).toBeLessThan(2.8);
 });
 
@@ -455,4 +505,108 @@ test("newline-separated cookie control: identical bytes, bounded rescans", () =>
   // quadratic while this one stays flat. One timing alone cannot tell "the regex
   // got slow" from "the box got busy".
   expect(growthPerDoubling("Cookie: sid=a; b=c; ", "\n")).toBeLessThan(2.8);
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial-review findings, round 1. Every case below LEAKED at ebfa05d.
+
+test("a request Cookie header has no attributes, so no pair is exempt", () => {
+  // RFC 6265 §4.2.1: `cookie-string = cookie-pair *( ";" SP cookie-pair )`.
+  // `Path`, `Domain`, `Expires`, `Max-Age`, `SameSite` are RESPONSE attributes
+  // and mean nothing in a request, so in a request header those are ordinary
+  // cookie NAMES chosen by the application and their values are credentials.
+  // The first version of this rule could not tell the two headers apart -- it
+  // starts matching at the `cookie` substring -- so a request cookie inherited
+  // the response header's exemptions and walked straight through.
+  const cases = [
+    `Cookie: sid=1; path=/${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; domain=${COOKIE_CREDENTIAL}.example`,
+    `Cookie: sid=1; expires=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; max-age=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; samesite=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; secure=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; httponly=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; priority=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; version=${COOKIE_CREDENTIAL}`,
+    `Cookie: sid=1; partitioned=${COOKIE_CREDENTIAL}`,
+    // Casing and the `=` separator reach the same detection, so pin them too.
+    `cookie: sid=1; PATH=/${COOKIE_CREDENTIAL}`,
+    `COOKIE=sid=1; Path=/${COOKIE_CREDENTIAL}`,
+    `HTTP_COOKIE=sid=1; domain=${COOKIE_CREDENTIAL}.example`,
+    `{"headers":{"cookie":"sid=1; path=/${COOKIE_CREDENTIAL}"}}`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(COOKIE_CREDENTIAL);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+});
+
+test("Set-Cookie attribute exemptions are narrow enough to exclude a credential", () => {
+  // The exemption's VALUE shapes were measured far looser than the guard needed
+  // to be: `expires` accepted any run of up to 32 alphanumerics, which is
+  // exactly the shape of a session id, and `domain` was length-unbounded and
+  // accepted an 87-character JWT-shaped token. 12 of 14 attribute-named probes
+  // preserved a synthetic credential.
+  const jwtShaped = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJTWU5USDAwMDAifQ.SYNTHsignature0000notreal";
+  const cases = [
+    `Set-Cookie: sid=1; Expires=${COOKIE_CREDENTIAL}`,
+    `Set-Cookie: sid=1; Expires=SYNTHETICSESSIONID000000000000AB`,
+    `Set-Cookie: sid=1; Domain=${jwtShaped}`,
+    `Set-Cookie: sid=1; Max-Age=${COOKIE_CREDENTIAL}`,
+    `Set-Cookie: sid=1; SameSite=${COOKIE_CREDENTIAL}`,
+    // The opening pair is the cookie in a Set-Cookie too, so an attribute name
+    // in first position is never exempt.
+    `Set-Cookie: path=/${COOKIE_CREDENTIAL}`,
+    `Set-Cookie: domain=${COOKIE_CREDENTIAL}.example`,
+    // A valueless flag ahead of the cookie must not spend the opening-pair
+    // protection: pairs are counted, not tokens.
+    `Set-Cookie: Secure; path=/${COOKIE_CREDENTIAL}`,
+    `Set-Cookie: HttpOnly; Secure; domain=${COOKIE_CREDENTIAL}.example`
+  ] as const;
+
+  for (const input of cases) {
+    const redacted = redactSensitiveText(input);
+    expect(redacted).not.toContain(COOKIE_CREDENTIAL);
+    expect(redacted).not.toContain(jwtShaped);
+    expect(redactSensitiveText(redacted)).toBe(redacted);
+  }
+
+  // ...and the exemption must still WORK, or the guard above would have been
+  // bought by deleting the feature. These are real attribute values.
+  const attributed = redactSensitiveText(
+    `Set-Cookie: sid=${COOKIE_CREDENTIAL}; Expires=Wed, 09 Jun 2027 10:18:14 GMT; Max-Age=3600; Domain=example.test; Path=/admin; SameSite=Lax; Priority=High; HttpOnly; Secure`
+  );
+  expect(attributed).not.toContain(COOKIE_CREDENTIAL);
+  for (const survivor of ["Expires=Wed, 09 Jun 2027 10:18:14 GMT", "Max-Age=3600", "Domain=example.test", "Path=/admin", "SameSite=Lax", "Priority=High", "HttpOnly", "Secure"]) {
+    expect(attributed).toContain(survivor);
+  }
+});
+
+test("masking a cookie does not destroy the structure around it", () => {
+  // Replacing everything after `=` swallowed the closing quotes and brackets of
+  // a cookie logged inside JSON, so the line stopped being parseable. Not a
+  // leak, but it contradicts this rule's own invariant that output differs from
+  // input only where a value was masked -- and destroying context is the defect
+  // this file already had to fix once on the authorization side.
+  const input = `{"set-cookie": ["a=1", "sid=${COOKIE_CREDENTIAL}"]}`;
+  const redacted = redactSensitiveText(input);
+  expect(redacted).not.toContain(COOKIE_CREDENTIAL);
+  // Count QUOTES, not brackets: `[REDACTED]` contains a `]` of its own, so a
+  // bracket count compares two different things and is not a structure check.
+  // The marker carries no quote, so the quote count is a clean invariant.
+  expect(redacted.split('"').length).toBe(input.split('"').length);
+  expect(redacted.endsWith('"]}')).toBe(true);
+  expect(redacted).toBe('{"set-cookie": ["a=[REDACTED]", "sid=[REDACTED]"]}');
+  expect(redactSensitiveText(redacted)).toBe(redacted);
+});
+
+test("positive control: the round-1 assertions can fail", () => {
+  // Each assertion above is an ABSENCE claim, so each needs proof the literal is
+  // findable when nothing masks it.
+  const jwtShaped = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJTWU5USDAwMDAifQ.SYNTHsignature0000notreal";
+  expect(redactSensitiveText(`The log mentioned ${COOKIE_CREDENTIAL} in passing.`)).toContain(COOKIE_CREDENTIAL);
+  expect(redactSensitiveText(`The log mentioned ${jwtShaped} in passing.`)).toContain(jwtShaped);
+  expect(redactSensitiveText("The log mentioned SYNTHETICSESSIONID000000000000AB in passing.")).toContain("SYNTHETICSESSIONID000000000000AB");
 });
