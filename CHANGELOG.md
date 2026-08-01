@@ -2,6 +2,45 @@
 
 All notable changes to `@hasna/tai` are documented in this file.
 
+## 0.1.6 - 2026-08-01
+
+Security release. **`redactSensitiveText` returned the credential BESIDE a `[REDACTED]`
+marker whenever the value arrived with an escaped quote** — which is what an ordinary
+`JSON.stringify(req.headers)` produces, with no attacker, no double encoding and no
+hand-written escaping.
+
+- **The quoted-value scan no longer terminates on an escaped quote.** RFC 7616 Digest and
+  Hawk carry quoted parameters natively, so one plain serialization emits
+  `"authorization":"Digest username=\"u\", response=\"<cred>\""`. The previous body
+  stopped at the first quote CHARACTER regardless of a preceding backslash, masked the four
+  characters before it, and emitted the credential intact after the marker. That is worse
+  than no rule: the next reader greps for `[REDACTED]`, finds it, and stops looking.
+- **One shared `QUOTED_VALUE_BODY` replaces eight independent copies** of a quoting model
+  that did not understand escaping. The defect was that the copies drifted; a fix applied
+  only to the copies an author happened to be reading is how this file already grew four
+  list-shaped guards. An invariant test asserts every rule captures the quote as group 2.
+- **The escape-aware body is linear by construction, not by a bound.** Its two branches are
+  disjoint on their first character (`\\[^\r\n]` vs `[^\\\r\n]`), so a run of
+  backslashes has exactly one parse. The obvious form `(?:\\.|(?!\2)[^\r\n])*` lets a
+  backslash be consumed either way, giving exponentially many partitions and a ReDoS on a
+  failing suffix — this file has shipped two quadratic rules already.
+- **Neighbouring fields still survive.** Over-redaction that deletes the fields beside a
+  credential removes the same leak count as a correct fix, so credential-absence alone
+  cannot tell the two apart; the neighbouring-field guard is asserted separately.
+  **Scoped honestly:** this covers fields beside the header and `Set-Cookie` attributes
+  inside it. It does NOT mean a request `Cookie:` header keeps its `Path`/`SameSite`
+  text — RFC 6265 4.2.1 makes that header pairs and nothing else, so those are
+  application-chosen cookie names whose values are credentials, and 0.1.5 already masked
+  them on every raw and unquoted shape. On the escaped-quote shape 0.1.5 appeared to
+  preserve them only because the scan terminated early; 0.1.6 makes the pre-existing
+  attribute logic reachable. That is convergence to intended behaviour, not new
+  behaviour — but a reader diffing logs across the upgrade will see it, so it is stated.
+
+**Known residual, unchanged by this release and named rather than implied:** on a RAW
+single-line log the Authorization rule's unquoted branch has no right delimiter and runs to
+end of line, so an unrelated field following the header on the same line is destroyed.
+Measured identically on 0.1.5 and 0.1.6. JSON-serialized shapes are unaffected.
+
 ## 0.1.5 - 2026-08-01
 
 Security release. **Every published version through 0.1.4 emits session cookies verbatim.**
