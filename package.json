@@ -1,6 +1,6 @@
 {
   "name": "@hasna/tai",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Terminal AI that keeps the terminal normal while turning natural-language requests into safe shell actions.",
   "type": "module",
   "license": "Apache-2.0",
