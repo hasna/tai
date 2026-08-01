@@ -34,6 +34,8 @@
   "scripts": {
     "build": "rm -rf dist && bun build src/index.ts src/cli/index.ts src/mcp/index.ts --outdir dist --target node && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run typecheck && bun run test",
     "test": "bun test",
     "dev:cli": "bun run src/cli/index.ts",
     "dev:mcp": "bun run src/mcp/index.ts"
